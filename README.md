@@ -39,6 +39,20 @@ The tool uses `cloc` to calculate precise "Ground Truth" line counts and languag
 
   Or place `cloc.exe` in the tool directory or your system's PATH.
 
+> **Note on the bundled `cloc.exe`**
+>
+> The `cloc.exe` in this repository is not our own code. It is the official Windows build of **cloc v2.08**, written by Al Danial and released under the **GNU GPL v2**. Source and upstream releases: [github.com/AlDanial/cloc](https://github.com/AlDanial/cloc).
+>
+> It is vendored purely for convenience on Windows: `cloc` is a Perl script, and Windows has no Perl by default, so upstream ships it packed with [PAR::Packer](https://metacpan.org/pod/pp) into a standalone `.exe` with a Perl interpreter embedded. That is why the file is ~9.5 MB.
+>
+> The binary is **Windows-only**. [`getClocCommand()`](./Repo_analysis_tool.py) only looks for `cloc.exe` when `sys.platform == "win32"`; on macOS and Linux it looks for a plain `cloc` and otherwise falls back to whichever `cloc` is on your PATH. Installing via Homebrew or your package manager (see below) is the preferred route on every platform, and the tool works fine without this file as long as `cloc` is on PATH.
+>
+> Verification, if you want to confirm the binary matches what is described here:
+>
+> ```
+> SHA-256: 4529557d957ade0dd45746eae10e9c51ee01061bb617eeeab256672faf6e42c6
+> ```
+
 #### macOS Setup
 
 If you are using macOS, you can install `cloc` using Homebrew:
