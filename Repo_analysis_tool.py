@@ -6240,10 +6240,16 @@ def runAnalysis(args: argparse.Namespace) -> Any:
         checkpoint = AnalysisCheckpoint(
             prOutDir, analysisCheckpointSignature(args, targetDir)
         )
+        noResume = bool(getattr(args, "no_resume", False))
+        if noResume:
+            # --no-resume: forget saved stages and the completion marker, so
+            # every stage runs again and overwrites the checkpoint.
+            checkpoint.data["completed"] = {}
         completedAnalysis = checkpoint.get("completed_analysis")
         # Migrate reports produced before persistent completion markers were
         # introduced. Do this only when there is no interrupted newer run.
-        if completedAnalysis is None and not checkpoint.data["completed"] and args.max_files is None:
+        if (not noResume and completedAnalysis is None
+                and not checkpoint.data["completed"] and args.max_files is None):
             existingReportFile = os.path.join(prOutDir, f"{repoName}_report.json")
             try:
                 with open(existingReportFile, "r", encoding="utf-8") as handle:
@@ -6848,6 +6854,7 @@ def runProjectsAnalysis(args: argparse.Namespace) -> str:
                 ),
                 capture_report=True,
                 audit_preflight_complete=True,
+                no_resume=getattr(args, "no_resume", False),
                 **provenanceOptions(args),
             )
             analysis = runAnalysis(repo_args)
@@ -6982,6 +6989,8 @@ Examples:
                         help="Opt in to sending sampled commit hashes to anonymous GitHub public search")
     parser.add_argument("--remove-origin", action="store_true",
                         help="Explicitly remove origin URLs/tracking after provenance is saved (default: preserve)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore saved checkpoints and finished results; analyze every repository from the beginning")
 
     if len(sys.argv) == 1:
         try:
@@ -7065,6 +7074,7 @@ Examples:
                     gitlab_token=args.gitlab_token,
                     bitbucket_token=args.bitbucket_token,
                     audit_preflight_complete=True,
+                    no_resume=getattr(args, "no_resume", False),
                     **provenanceOptions(args),
                     origin_cleanup_csv=os.path.join(
                         args.output_dir, "origin_remote_cleanup.csv"

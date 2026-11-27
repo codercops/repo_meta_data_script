@@ -197,12 +197,13 @@ For macOS or Ubuntu/Linux, use the equivalent command shown in setup step 10.
 
 Analysis resumes automatically from the last completed stage when the same
 repository and options are run again. For Git repositories, a changed `HEAD`
-invalidates the checkpoint. Repository checkpoints are saved in each
-repository's output folder (normally
-`outputs/<repository-key>/analysis_checkpoint.json`); batch and project runs
-also save their completed-repository progress in the output directory.
-Checkpoints are removed when the corresponding run completes. Use
-`--no-resume` to ignore existing checkpoints and start from the beginning.
+invalidates the checkpoint, and so do uncommitted changes. Each repository's
+checkpoint is a hidden `.analysis_checkpoint.json` file in its output folder
+(`outputs/<repository>/` for a single run, `outputs/<project>/<repository>/` in
+project mode). After a repository finishes, the file keeps only the finished
+result, so running the same command again skips that repository. Use
+`--no-resume` to ignore existing checkpoints and analyze everything from the
+beginning.
 
 ### Project acceptance
 
