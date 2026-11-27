@@ -6212,7 +6212,12 @@ def runAnalysis(args: argparse.Namespace) -> Any:
             )
             if not branchReady:
                 return False
-            
+
+        if not isUrl:
+            # repoName is only set in the URL branch above. Local paths use the
+            # folder name, the same name the report and its output folder use.
+            repoName = os.path.basename(targetDir)
+
         report = {
             "repo": repoName if isUrl else os.path.basename(targetDir),
             "repository_key": repoName if isUrl else os.path.basename(targetDir),
