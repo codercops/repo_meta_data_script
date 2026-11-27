@@ -4,6 +4,7 @@ import json
 import csv
 import argparse
 import hashlib
+import base64
 import re
 import subprocess
 import time
@@ -11,9 +12,11 @@ import logging
 import multiprocessing
 import threading
 import datetime
+import random
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional, Any
+from provenance import GitHubClient, analyze_provenance, github_name, provenance_columns, safe_url, save_provenance
 
 try:
     import psutil
@@ -37,6 +40,9 @@ except ImportError:
         pass
 
 CSV_LOCK = threading.Lock()
+BITBUCKET_HTTP = threading.local()
+BITBUCKET_RATE_LOCK = threading.Lock()
+BITBUCKET_RATE_PAUSE_UNTIL = 0.0
 
 try:
     import tiktoken
@@ -62,6 +68,7 @@ MAX_BUCKET_COMPARE = 300
 
 GIT_LOG_TIMEOUT = 120
 CODE_AGE_THRESHOLDS_YEARS = [1, 2]
+REQUIRED_SCC_VERSION = "3.7.0"
 
 # Stage 4: Composite rating criteria
 RATING_CRITERIA = {
@@ -208,7 +215,7 @@ BACKEND_LANGUAGES = {
 NON_CORE_FORMATS = {
     "JSON", "XML", "YAML", "CSV", "TOML", "INI", "Protocol Buffers", "Graphviz (DOT)",
     "SVG", "SQL", "Properties", "Excel", "Parquet", "HCL", "Starlark",
-    "Markdown", "Text", "reStructuredText", "AsciiDoc", "Doxygen", "Org", "TeX", "Org Mode",
+    "Markdown", "Text", "Plain Text", "reStructuredText", "AsciiDoc", "Doxygen", "Org", "TeX", "Org Mode",
     "Gradle", "ProGuard", "Windows Resource File", "Maven POM", "Protocol Buffers",
     "PowerShell", "Bourne Shell", "Bourne Again Shell", "Fish Shell", "DOS Batch", "make",
     "CMake", "Dockerfile", "Vagrantfile", "Procfile", "Rakefile", "Gemfile", "Pipfile",
@@ -449,7 +456,7 @@ SKIP_DIRS = {
     '.env', 'virtualenv', 'conda-env', 'site-packages', 'dist-packages',
     '.yarn', '.pnp', 'bower_components', 'jspm_packages', 'web_modules',
     'migrations', 'alembic',
-    'test', 'tests', 'spec', 'specs', 'docs', 'documentation',
+    'test', 'tests', 'spec', 'specs',
     'examples', 'samples', 'demo', 'benchmarks', 'screenshots',
     'Lib', 'lib64', 'Scripts', 'bin', 'Include', 'obj',
     'third_party', 'third-party', 'extern', 'external', 'custom_node_modules'
@@ -558,6 +565,32 @@ NON_CODE_EXTENSIONS = {
     ".log", ".tmp", ".temp", ".bak", ".swp", ".swo",
     ".lock", ".pem", ".crt", ".key", ".cer",
     ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar"
+}
+
+# Text assets that are useful to an LLM even though they are not source code.
+DOC_TEXT_EXTENSIONS = {".md", ".markdown", ".rst", ".txt", ".adoc", ".tex"}
+CONFIG_TEXT_EXTENSIONS = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml"}
+LLM_TEXT_EXTENSIONS = DOC_TEXT_EXTENSIONS | CONFIG_TEXT_EXTENSIONS
+
+# Business-defined non-authored directories. The authored SCC scan excludes
+# these in addition to SCC-detected generated files (--no-gen).
+SCC_NON_AUTHORED_DIRS = {
+    ".git", ".hg", ".svn", "vendor", "node_modules", "dist", "build",
+    "generated", "migrations", "autogen", "auto-generated", "generated-src",
+    "generated-code", "__pycache__", ".pytest_cache", "obj", "coverage",
+    ".nyc_output", ".next", ".nuxt", ".gradle", ".cxx", "Pods",
+    "DerivedData", "vendor_prefixed", "vendor8", "bower_components",
+    "generated-sources", "intermediates", ".idea", ".kotlin", ".vite",
+    ".cache",
+}
+
+# SCC recognizes documentation/configuration/data formats too. They remain in
+# total repository LOC, but are not source-code token inputs; their tokens are
+# counted independently through DOC_TEXT_EXTENSIONS/CONFIG_TEXT_EXTENSIONS.
+SCC_NON_SOURCE_LANGUAGES = {
+    "JSON", "XML", "YAML", "CSV", "TOML", "INI", "Plain Text", "Text",
+    "Markdown", "reStructuredText", "AsciiDoc", "Doxygen", "Org", "Org Mode",
+    "TeX", "SVG", "Properties", "Excel", "Parquet", "License",
 }
 
 SPECIAL_CODE_FILES = {
@@ -694,7 +727,8 @@ def countLoc(text: str) -> int:
 
 
 def computeSimilarity(tokens1: List[str], tokens2: List[str]) -> float:
-    set1, set2 = set(tokens1), set(tokens2)
+    set1 = tokens1 if isinstance(tokens1, (set, frozenset)) else set(tokens1)
+    set2 = tokens2 if isinstance(tokens2, (set, frozenset)) else set(tokens2)
     if not set1 and not set2:
         return 1.0
 
@@ -704,51 +738,36 @@ def computeSimilarity(tokens1: List[str], tokens2: List[str]) -> float:
     return len(set1 & set2) / len(set1 | set2)
 
 
-def cloneRepo(repoUrl: str, targetDir: str, githubToken: Optional[str] = None, gitlabToken: Optional[str] = None) -> bool:
-    actualUrl = repoUrl
-    maskedUrl = repoUrl
-    tokens_to_mask = []
+def cloneRepo(repoUrl: str, targetDir: str, githubToken: Optional[str] = None,
+              gitlabToken: Optional[str] = None, bitbucketToken: Optional[str] = None,
+              branch: Optional[str] = None) -> bool:
+    authEnv, authProvider = gitNetworkAuthEnv(
+        repoUrl, githubToken, gitlabToken, bitbucketToken)
+    # Never pass the supplied PAT in command arguments or save it in origin.
+    actualUrl = safe_url(repoUrl) if authProvider else repoUrl
 
-    # Check for GitLab
-    glInfo = extractGitLabRepoInfo(targetDir, repoUrl)
-    if glInfo and gitlabToken:
-        domain, project_path, _ = glInfo
-        actualUrl = f"https://oauth2:{gitlabToken}@{domain}/{project_path}.git"
-        maskedUrl = f"https://oauth2:[MASKED]@{domain}/{project_path}.git"
-        tokens_to_mask.append(gitlabToken)
-    else:
-        # Check for GitHub
-        ghInfo = extractGitHubRepoInfo(targetDir, repoUrl)
-        if ghInfo and githubToken:
-            owner, repo = ghInfo
-            actualUrl = f"https://{githubToken}@github.com/{owner}/{repo}.git"
-            maskedUrl = f"https://[MASKED]@github.com/{owner}/{repo}.git"
-            tokens_to_mask.append(githubToken)
+    cloneArgs = ["git", "clone", "--progress"]
+    if branch:
+        cloneArgs.extend(["--branch", branch])
+    cloneArgs.extend([actualUrl, targetDir])
 
-    def mask_text(text: str) -> str:
-        if not text:
-            return text
-        for t in tokens_to_mask:
-            if t:
-                text = text.replace(t, "[MASKED]")
-        return text
-
-    if actualUrl != repoUrl:
-        logger.info(f"[cloneRepo] Rewrote URL for authenticated clone: {maskedUrl}")
+    if authProvider:
+        logger.info(f"[cloneRepo] Using supplied {authProvider} token for HTTPS clone")
         try:
             process = subprocess.Popen(
-                ["git", "clone", "--progress", actualUrl, targetDir],
+                cloneArgs,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
-                errors="replace"
+                errors="replace",
+                env=authEnv,
             )
             
             def stream_reader(pipe, dest):
                 try:
                     for line in pipe:
-                        dest.write(mask_text(line))
+                        dest.write(line)
                         dest.flush()
                 except Exception:
                     pass
@@ -762,23 +781,30 @@ def cloneRepo(repoUrl: str, targetDir: str, githubToken: Optional[str] = None, g
             t_out.join()
             t_err.join()
 
+            if process.returncode != 0:
+                logger.error("[cloneRepo] HTTPS clone failed without interactive login. "
+                             "Check repository access and token permissions.")
             return process.returncode == 0
         except FileNotFoundError:
             logger.error("[cloneRepo] 'git' command not found. Please install git.")
             return False
         except Exception as e:
-            logger.error(f"[cloneRepo] Unexpected error during authenticated clone: {mask_text(str(e))}")
+            logger.error(f"[cloneRepo] Authenticated clone failed: {type(e).__name__}")
             return False
     else:
         try:
             result = subprocess.run(
-                ["git", "clone", "--progress", actualUrl, targetDir],
+                cloneArgs,
                 stdout=sys.stdout,
                 stderr=sys.stderr,
                 text=True,
                 encoding="utf-8",
-                errors="replace"
+                errors="replace",
+                env=authEnv,
             )
+            if result.returncode != 0 and repoUrl.lower().startswith("https://"):
+                logger.error("[cloneRepo] HTTPS clone failed without interactive login. "
+                             "Check the URL and matching provider token.")
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
             logger.error(f"[cloneRepo] Clone failed with exit code {e.returncode}")
@@ -855,7 +881,7 @@ def runStage1Analysis(rootDir: str, maxFiles: Optional[int] = None) -> Tuple[Dic
     fileList = []
 
     for dirpath, dirnames, filenames in os.walk(rootDir):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith('.')]
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and (not d.startswith('.') or d == '.github')]
 
         relDir = os.path.relpath(dirpath, rootDir)
         if relDir != ".":
@@ -872,7 +898,9 @@ def runStage1Analysis(rootDir: str, maxFiles: Optional[int] = None) -> Tuple[Dic
             basename = os.path.basename(file)
             basenameLower = basename.lower()
 
-            if ext in SKIP_EXTENSIONS or (file.startswith('.') and ext):
+            # Documentation/configuration is part of the LLM context even though
+            # several of these extensions are excluded from code-only analysis.
+            if (ext in SKIP_EXTENSIONS and ext not in LLM_TEXT_EXTENSIONS) or (file.startswith('.') and ext):
                 continue
 
             filepath = os.path.join(dirpath, file)
@@ -934,105 +962,185 @@ def runStage1Analysis(rootDir: str, maxFiles: Optional[int] = None) -> Tuple[Dic
     }, fileList
 
 
-def getClocCommand() -> str:
+def getSccCommand() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     ext = ".exe" if sys.platform == "win32" else ""
-    local_cloc = os.path.join(script_dir, f"cloc{ext}")
+    local_scc = os.path.join(script_dir, f"scc{ext}")
 
-    if os.path.isfile(local_cloc):
-        return local_cloc
-    return "cloc"
+    if os.path.isfile(local_scc):
+        return local_scc
+    return "scc"
 
 
-def runCloc(repoDir: str, fileList: List[str] = None) -> Dict[str, Any]:
+def validateSccVersion() -> None:
+    """Fail fast unless the installed SCC version is the required one."""
+    scc_command = getSccCommand()
+    try:
+        result = subprocess.run(
+            [scc_command, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"SCC {REQUIRED_SCC_VERSION} is required, but 'scc' was not found. "
+            "Install it or place scc.exe in the tool directory."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Timed out while checking the SCC version.") from exc
+
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"SCC version check failed with exit code {result.returncode}: {output or 'no output'}"
+        )
+
+    match = re.search(r"\b(\d+\.\d+\.\d+)\b", output)
+    installed_version = match.group(1) if match else None
+    if installed_version != REQUIRED_SCC_VERSION:
+        found = installed_version or (output or "unknown")
+        raise RuntimeError(
+            f"SCC {REQUIRED_SCC_VERSION} is required. Installed version: {found}."
+        )
+
+
+def runScc(repoDir: str, authoredOnly: bool = False) -> Dict[str, Any]:
     """
-    Run cloc on the repository and return the parsed JSON output.
-    If fileList is provided, it uses --list-file to ensure perfect sync.
+    Run SCC and return normalized totals, language breakdown, and source files.
+
+    The total scan matches `scc .`. The authored scan applies the agreed
+    business policy: SCC-generated files plus configured dependency/vendor/
+    build/migration directories are non-authored. `source_files` contains only
+    authored programming-language files and drives source token calculation.
     """
     try:
-        cloc_cmd = getClocCommand()
-        cmd = [cloc_cmd, "--json", "--quiet"]
+        cmd = [getSccCommand(), "--format", "json2"]
+        if authoredOnly:
+            cmd.extend([
+                "--no-gen",
+                "--by-file",
+                "--exclude-dir",
+                ",".join(sorted(SCC_NON_AUTHORED_DIRS, key=str.lower)),
+            ])
+        cmd.append(".")
+        result = subprocess.run(
+            cmd, cwd=repoDir, capture_output=True, text=True,
+            encoding="utf-8", errors="replace"
+        )
+        if result.returncode != 0:
+            logger.warning(f"[runScc] SCC exited with {result.returncode}: {result.stderr.strip()}")
+            return {}
+        if not result.stdout.strip():
+            return {}
 
-        if fileList:
-            # Create a temporary file list for cloc
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp:
-                for f in fileList:
-                    tmp.write(f + "\n")
-                tmp_path = tmp.name
+        payload = json.loads(result.stdout)
+        summaries = payload.get("languageSummary", [])
+        totals = {"code": 0, "comment": 0, "blank": 0, "lines": 0, "nFiles": 0}
+        sourceTotals = {"code": 0, "comment": 0, "blank": 0, "lines": 0, "nFiles": 0}
+        languages = {}
+        sourceFiles = []
+        repoAbs = os.path.abspath(repoDir)
 
-            cmd.append(f"--list-file={tmp_path}")
-            result = subprocess.run(cmd, cwd=repoDir, capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace")
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        else:
-            # Fallback to directory scan if no list provided
-            final_skip_dirs = set(SKIP_DIRS)
-            for root, dirs, _ in os.walk(repoDir):
-                if any(sd in root for sd in SKIP_DIRS):
-                    dirs[:] = []
-                    continue
-                for d in list(dirs):
-                    candidate = os.path.join(root, d)
-                    is_venv_cfg = os.path.isfile(os.path.join(candidate, "pyvenv.cfg"))
-                    has_site_pkgs = os.path.isdir(os.path.join(candidate, "Lib", "site-packages"))
-                    if is_venv_cfg or has_site_pkgs:
-                        final_skip_dirs.add(d)
-                        dirs.remove(d)
+        for stats in summaries:
+            language = str(stats.get("Name") or "Unknown")
+            normalized = {
+                "code": int(stats.get("Code", 0) or 0),
+                "comment": int(stats.get("Comment", 0) or 0),
+                "blank": int(stats.get("Blank", 0) or 0),
+                "lines": int(stats.get("Lines", 0) or 0),
+                "nFiles": int(stats.get("Count", 0) or 0),
+            }
+            languages[language] = normalized
+            for key in totals:
+                totals[key] += normalized[key]
 
-            if final_skip_dirs:
-                cmd.append(f"--exclude-dir={','.join(final_skip_dirs)}")
-            if SKIP_EXTENSIONS:
-                clean_exts = [ext.lstrip('.') for ext in SKIP_EXTENSIONS]
-                cmd.append(f"--exclude-ext={','.join(clean_exts)}")
-            cmd.append(".")
-            result = subprocess.run(cmd, cwd=repoDir, capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace")
+            if authoredOnly and language not in SCC_NON_SOURCE_LANGUAGES:
+                for key in sourceTotals:
+                    sourceTotals[key] += normalized[key]
+                for fileStats in stats.get("Files", []) or []:
+                    location = fileStats.get("Location")
+                    if not location:
+                        continue
+                    path = os.path.normpath(
+                        location if os.path.isabs(location) else os.path.join(repoAbs, location)
+                    )
+                    try:
+                        if os.path.commonpath([repoAbs, os.path.abspath(path)]) != repoAbs:
+                            continue
+                    except ValueError:
+                        continue
+                    if os.path.isfile(path):
+                        sourceFiles.append(path)
 
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
+        return {
+            "totals": totals,
+            "source_totals": sourceTotals if authoredOnly else totals.copy(),
+            "languages": languages,
+            "source_files": list(dict.fromkeys(sourceFiles)),
+            "source": "scc",
+            "mode": "authored" if authoredOnly else "total",
+        }
     except Exception as e:
-        logger.warning(f"[runCloc] Failed to run cloc: {e}")
+        logger.warning(f"[runScc] Failed to run SCC: {e}")
     return {}
 
 
-def processFileBatch(batch: List[str]) -> List[Dict[str, Any]]:
+def processFileBatch(batch: List[Any]) -> List[Dict[str, Any]]:
     """
     Worker function to process file batch in parallel.
     Computes LOC, tokens, and prepares data for duplication analysis.
-    Only code files contribute to token metrics.
+    Code, documentation, and configuration files contribute to token metrics.
+    Duplication and AI-detection inputs remain code-only.
     """
     results = []
-    for filepath in batch:
+    for workItem in batch:
+        if isinstance(workItem, (tuple, list)):
+            filepath, forcedCategory = workItem
+        else:
+            filepath, forcedCategory = workItem, None
         ext = os.path.splitext(filepath)[1].lower()
         basename = os.path.basename(filepath)
 
         isCode, classification = classifyFile(basename, ext)
 
-        if not isCode:
+        isTextAsset = ext in LLM_TEXT_EXTENSIONS
+        if forcedCategory == "code":
+            isCode = True
+        elif forcedCategory in {"docs", "config"}:
+            isCode = False
+            isTextAsset = True
+        if not isCode and not isTextAsset:
             continue
 
-        if isBinary(filepath):
-            continue
+        category = forcedCategory or (
+            "code" if isCode else ("docs" if ext in DOC_TEXT_EXTENSIONS else "config")
+        )
 
         try:
-            if os.path.getsize(filepath) > MAX_FILE_BYTES:
+            # SCC-authored source files define the complete code-token corpus.
+            # Preserve the historical size cap only for docs/config assets.
+            if category != "code" and os.path.getsize(filepath) > MAX_FILE_BYTES:
                 continue
 
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
+            # One disk read supplies binary detection, hashing, and tokenization.
+            with open(filepath, "rb") as f:
+                raw = f.read()
+            if b"\x00" in raw[:8192]:
+                continue
+            content = raw.decode("utf-8", errors="ignore")
 
             if not content:
                 continue
 
             llmTokens = len(ENCODING.encode(content)) if HAS_TIKTOKEN else (len(content) // 4)
-            lexicalTokens = len(countLexicalTokens(content))
+            lexicalTokenList = countLexicalTokens(content)
+            lexicalTokens = len(lexicalTokenList)
             loc = countLoc(content)
 
-            tokenList = countLexicalTokens(content) if (10 < lexicalTokens < 5000) else []
+            tokenList = frozenset(lexicalTokenList) if isCode and (10 < lexicalTokens < 5000) else frozenset()
 
             # Framework detection via imports (first 100 lines)
             foundFws = []
@@ -1050,8 +1158,9 @@ def processFileBatch(batch: List[str]) -> List[Dict[str, Any]]:
                 "lexical_tokens": lexicalTokens,
                 "loc": loc,
                 "frameworks": list(set(foundFws)),
-                "hash": hashFile(filepath),
-                "token_set": tokenList
+                "hash": hashlib.sha256(raw).hexdigest(),
+                "token_set": tokenList,
+                "category": category,
             })
         except Exception:
             continue
@@ -1060,27 +1169,53 @@ def processFileBatch(batch: List[str]) -> List[Dict[str, Any]]:
 
 
 def runStage2Analysis(
-    fileList: List[str]
+    fileList: List[str], authoredCodeFiles: Optional[List[str]] = None
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, List[str]]]:
     """
     Execute parallel deep analysis to compute total/per-file metrics,
     exact duplication (hash-based), and similarity-based duplication (Jaccard clustering).
     Uses ProcessPoolExecutor for CPU-bound tokenization.
     """
-    if not fileList:
+    authoredSet = {
+        os.path.normcase(os.path.abspath(path)) for path in (authoredCodeFiles or [])
+    }
+    categoryByPath: Dict[str, str] = {}
+    for path in authoredCodeFiles or []:
+        categoryByPath[os.path.normcase(os.path.abspath(path))] = "code"
+    for path in fileList:
+        normalized = os.path.normcase(os.path.abspath(path))
+        if normalized in authoredSet:
+            continue
+        ext = os.path.splitext(path)[1].lower()
+        if ext in DOC_TEXT_EXTENSIONS:
+            categoryByPath[normalized] = "docs"
+        elif ext in CONFIG_TEXT_EXTENSIONS:
+            categoryByPath[normalized] = "config"
+
+    codeSet = {path for path, category in categoryByPath.items() if category == "code"}
+    docsSet = {path for path, category in categoryByPath.items() if category == "docs"}
+    configSet = {path for path, category in categoryByPath.items() if category == "config"}
+    if codeSet & docsSet or codeSet & configSet or docsSet & configSet:
+        raise ValueError("[stage2] Token input categories overlap")
+
+    workItems = [(path, category) for path, category in categoryByPath.items()]
+    if not workItems:
         return {}, {}, {}, {}
 
-    numWorkers = getWorkerCount()
-    batchSize = getAdaptiveBatchSize(fileList)
-    batches = [fileList[i:i + batchSize] for i in range(0, len(fileList), batchSize)]
+    tokenPaths = [path for path, _ in workItems]
+    batchSize = getAdaptiveBatchSize(tokenPaths)
+    batches = [workItems[i:i + batchSize] for i in range(0, len(workItems), batchSize)]
+    numWorkers = min(getWorkerCount(), len(batches))
 
-    logger.info(f"[stage2] Workers={numWorkers}  Batch={batchSize}  Files={len(fileList)}")
+    logger.info(f"[stage2] Workers={numWorkers}  Batch={batchSize}  Files={len(workItems)}")
 
     perFileLlm = {}
     perFileLexical = {}
     perFileLoc = {}
     totalLlm = 0
+    totalLlmCode = totalLlmDocs = totalLlmConfig = 0
     totalLexical = 0
+    totalLexicalCode = totalLexicalDocs = totalLexicalConfig = 0
     totalLoc = 0
     contentHashes = defaultdict(list)
     fileTokensMap = {}
@@ -1089,15 +1224,20 @@ def runStage2Analysis(
     completedFiles = 0
     t0 = time.time()
 
-    with ProcessPoolExecutor(max_workers=numWorkers) as executor:
-        futures = {executor.submit(processFileBatch, batch): batch for batch in batches}
+    # Avoid process startup/pickling overhead for a single small batch.
+    if len(batches) == 1:
+        completedBatches = [processFileBatch(batches[0])]
+    else:
+        with ProcessPoolExecutor(max_workers=numWorkers) as executor:
+            completedBatches = []
+            futures = {executor.submit(processFileBatch, batch): batch for batch in batches}
+            for future in as_completed(futures):
+                try:
+                    completedBatches.append(future.result())
+                except Exception:
+                    continue
 
-        for future in as_completed(futures):
-            try:
-                batchResults = future.result()
-            except Exception:
-                continue
-
+    for batchResults in completedBatches:
             for item in batchResults:
                 fp = item["filepath"]
                 llm = item["llm_tokens"]
@@ -1106,6 +1246,7 @@ def runStage2Analysis(
                 h = item["hash"]
                 ts = item["token_set"]
                 fws = item.get("frameworks", [])
+                category = item.get("category", "code")
 
                 totalLlm += llm
                 totalLexical += lex
@@ -1116,10 +1257,20 @@ def runStage2Analysis(
                 fileStatsMap[fp] = {"loc": loc, "llm_tokens": llm, "hash": h}
                 contentHashes[h].append(fp)
 
+                if category == "code":
+                    totalLlmCode += llm
+                    totalLexicalCode += lex
+                elif category == "docs":
+                    totalLlmDocs += llm
+                    totalLexicalDocs += lex
+                else:
+                    totalLlmConfig += llm
+                    totalLexicalConfig += lex
+
                 for fw in fws:
                     frameworkFindings["code_imports"].add(fw)
 
-                if loc >= MIN_LOC and ts and llm >= MIN_TOKENS:
+                if category == "code" and loc >= MIN_LOC and ts and llm >= MIN_TOKENS:
                     fileTokensMap[fp] = ts
 
                 completedFiles += 1
@@ -1127,7 +1278,7 @@ def runStage2Analysis(
             elapsed = time.time() - t0
             throughput = completedFiles / elapsed if elapsed > 0 else 0
             if completedFiles % 200 == 0:
-                logger.info(f"  → Processed {completedFiles}/{len(fileList)} files  ({throughput:.1f}/s)")
+                logger.info(f"  → Processed {completedFiles}/{len(workItems)} files  ({throughput:.1f}/s)")
 
     exactDuplicateTokens = 0
     exactDuplicateCount = 0
@@ -1207,10 +1358,18 @@ def runStage2Analysis(
     if len(similarClusters) > 0 and similarDuplicateTokens == 0 and exactDuplicateTokens == 0:
         raise ValueError("[stage2] Inconsistent similarity vs duplication metrics")
 
+    if totalLlm != totalLlmCode + totalLlmDocs + totalLlmConfig:
+        raise ValueError("[stage2] LLM token category totals do not reconcile")
+    if totalLexical != totalLexicalCode + totalLexicalDocs + totalLexicalConfig:
+        raise ValueError("[stage2] Lexical token category totals do not reconcile")
+
     return {
         "metrics": {
-            "llm_tokens": {"total": totalLlm, "per_file": perFileLlm},
-            "lexical_tokens": {"total": totalLexical, "per_file": perFileLexical},
+            "llm_tokens": {"total": totalLlm, "code": totalLlmCode, "docs": totalLlmDocs,
+                           "config": totalLlmConfig, "per_file": perFileLlm},
+            "lexical_tokens": {"total": totalLexical, "code": totalLexicalCode,
+                               "docs": totalLexicalDocs, "config": totalLexicalConfig,
+                               "per_file": perFileLexical},
             "loc": {"total": totalLoc, "per_file": perFileLoc}
         },
         "ratios": {
@@ -1348,7 +1507,8 @@ def runAiDetectionAnalysis(
     }
 
 
-def runGit(args: List[str], cwd: str, timeout: int = GIT_LOG_TIMEOUT) -> Optional[str]:
+def runGit(args: List[str], cwd: str, timeout: int = GIT_LOG_TIMEOUT,
+           env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Run a git command safely, returning stdout or None on failure."""
     try:
         result = subprocess.run(
@@ -1359,12 +1519,218 @@ def runGit(args: List[str], cwd: str, timeout: int = GIT_LOG_TIMEOUT) -> Optiona
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=env,
         )
         if result.returncode == 0:
             return result.stdout.strip()
         return None
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
         return None
+
+
+def githubGitAuthEnv(token: str) -> Dict[str, str]:
+    """Authenticate one GitHub HTTPS command without storing the PAT in Git config."""
+    return scopedGitAuthEnv(token, "https://github.com/", "x-access-token")
+
+
+def noPromptGitEnv() -> Dict[str, str]:
+    """Keep Git's credential helpers and prompts out of a network command."""
+    env = os.environ.copy()
+    try:
+        count = max(0, int(env.get("GIT_CONFIG_COUNT", "0")))
+    except ValueError:
+        count = 0
+    env[f"GIT_CONFIG_KEY_{count}"] = "credential.helper"
+    env[f"GIT_CONFIG_VALUE_{count}"] = ""
+    env[f"GIT_CONFIG_KEY_{count + 1}"] = "core.askPass"
+    env[f"GIT_CONFIG_VALUE_{count + 1}"] = ""
+    env["GIT_CONFIG_COUNT"] = str(count + 2)
+    env.pop("GIT_ASKPASS", None)
+    env.pop("SSH_ASKPASS", None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    return env
+
+
+def scopedGitAuthEnv(token: str, repoUrl: str, username: str) -> Dict[str, str]:
+    """Pass an HTTPS token only to the selected repository, without a URL password."""
+    env = noPromptGitEnv()
+    count = int(env["GIT_CONFIG_COUNT"])
+    key = f"http.{safe_url(repoUrl)}.extraheader"
+    credentials = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    for offset, value in enumerate(("", f"AUTHORIZATION: basic {credentials}")):
+        env[f"GIT_CONFIG_KEY_{count + offset}"] = key
+        env[f"GIT_CONFIG_VALUE_{count + offset}"] = value
+    env["GIT_CONFIG_COUNT"] = str(count + 2)
+    return env
+
+
+def gitNetworkAuthEnv(repoUrl: str, githubToken: Optional[str] = None,
+                      gitlabToken: Optional[str] = None,
+                      bitbucketToken: Optional[str] = None) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Choose a scoped PAT for a recognized HTTPS provider, or disable prompts."""
+    if repoUrl.lower().startswith(("git@", "ssh://")):
+        return None, None  # SSH authentication remains with the user's SSH agent.
+    if not repoUrl.lower().startswith("https://"):
+        return noPromptGitEnv(), None
+    if githubToken and github_name(repoUrl):
+        return githubGitAuthEnv(githubToken), "GitHub"
+    if gitlabToken and extractGitLabRepoInfo("", repoUrl):
+        return scopedGitAuthEnv(gitlabToken, repoUrl, "oauth2"), "GitLab"
+    if bitbucketToken and extractBitbucketRepoInfo("", repoUrl):
+        return scopedGitAuthEnv(bitbucketToken, repoUrl, "x-token-auth"), "Bitbucket"
+    return noPromptGitEnv(), None
+
+
+def _redactAuditTarget(target: str) -> str:
+    """Remove URL user-info before writing a repository target to an audit CSV."""
+    if not target:
+        return target
+    if not (target.startswith("http://") or target.startswith("https://")):
+        return target
+
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parsed = urlsplit(target)
+        hostname = parsed.hostname or ""
+        if not hostname:
+            return target
+        host = hostname
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        return re.sub(r"^(https?://)[^/@]+@", r"\1", target, flags=re.IGNORECASE)
+
+
+def removeOriginRemote(repoDir: str) -> Dict[str, Any]:
+    """Detach origin's URL (no more fetch/push possible) but keep refs/remotes/origin/*."""
+    if not os.path.exists(os.path.join(repoDir, ".git")):
+        return {"origin_present": False, "origin_removed": False,
+                "status": "not_applicable", "error": "Not a Git repository"}
+
+    remoteOutput = runGit(["remote"], repoDir)
+    if remoteOutput is None:
+        return {"origin_present": None, "origin_removed": False,
+                "status": "failed", "error": "Could not inspect Git remotes"}
+
+    if "origin" not in {l.strip() for l in remoteOutput.splitlines() if l.strip()}:
+        return {"origin_present": False, "origin_removed": False,
+                "status": "not_present", "error": ""}
+
+    # --unset-all returns exit code 5 if the key is absent, so tolerate that.
+    for key in ("remote.origin.url", "remote.origin.pushurl", "remote.origin.fetch"):
+        subprocess.run(["git", "config", "--unset-all", key],
+                       cwd=repoDir, capture_output=True, text=True)
+
+    # Also drop upstream tracking on local branches (branch.<name>.remote / .merge)
+    branches = runGit(["for-each-ref", "--format=%(refname:short)", "refs/heads"], repoDir) or ""
+    for b in branches.splitlines():
+        b = b.strip()
+        if b:
+            subprocess.run(["git", "branch", "--unset-upstream", b],
+                           cwd=repoDir, capture_output=True, text=True)
+
+    # Verify by checking the config, not `git remote` output.
+    stillHasUrl = runGit(["config", "--get-all", "remote.origin.url"], repoDir)
+    if stillHasUrl:
+        return {"origin_present": True, "origin_removed": False,
+                "status": "failed", "error": "Origin URL is still configured"}
+
+    return {"origin_present": True, "origin_removed": True,
+            "status": "removed", "error": ""}
+
+
+def writeOriginCleanupAudit(csvPath: str, record: Dict[str, Any]) -> None:
+    """Append one origin-cleanup result to the run's CSV audit file."""
+    fields = [
+        "timestamp_utc",
+        "repository_name",
+        "source_type",
+        "repository_target",
+        "local_path",
+        "origin_present",
+        "origin_removed",
+        "status",
+        "error",
+    ]
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(csvPath)), exist_ok=True)
+        with CSV_LOCK:
+            fileExists = os.path.isfile(csvPath) and os.path.getsize(csvPath) > 0
+            with open(csvPath, "a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+                if not fileExists:
+                    writer.writeheader()
+                writer.writerow({field: record.get(field, "") for field in fields})
+    except Exception as exc:
+        logger.warning(f"[originCleanup] Could not write audit CSV '{csvPath}': {exc}")
+
+
+def prepareAnalysisBranch(repoDir: str, requestedBranch: Optional[str],
+                          localRepository: bool = False,
+                          gitAuthEnv: Optional[Dict[str, str]] = None) -> Tuple[bool, Dict[str, str]]:
+    """Select a branch; local working copies are checked out without fetching/merging."""
+    requestedBranch = (requestedBranch or "").strip()
+    remoteHead = runGit(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoDir)
+    if not remoteHead and not localRepository:
+        runGit(["remote", "set-head", "origin", "--auto"], repoDir,
+               timeout=300, env=gitAuthEnv)
+        remoteHead = runGit(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoDir)
+    defaultBranch = remoteHead.split("/", 1)[1] if remoteHead and "/" in remoteHead else ""
+    targetBranch = requestedBranch or ("" if localRepository else defaultBranch)
+
+    if not targetBranch:
+        targetBranch = runGit(["symbolic-ref", "--short", "HEAD"], repoDir) or ""
+        defaultBranch = targetBranch
+
+    if requestedBranch:
+        valid = runGit(["check-ref-format", "--branch", requestedBranch], repoDir)
+        if valid is None:
+            logger.error(f"[branch] Invalid branch name: {requestedBranch}")
+            return False, {}
+
+    if targetBranch:
+        # Refresh the requested/default remote branch when possible. Failure is
+        # tolerated only when the corresponding local branch already exists.
+        if not localRepository:
+            fetched = runGit(["fetch", "origin", targetBranch], repoDir,
+                             timeout=300, env=gitAuthEnv)
+            if gitAuthEnv is not None and fetched is None:
+                logger.error("[branch] Git fetch failed without interactive login. "
+                             "Check the HTTPS URL, repository access, token permissions and branch.")
+                return False, {}
+        localExists = runGit(["rev-parse", "--verify", f"refs/heads/{targetBranch}"], repoDir)
+        remoteExists = runGit(["rev-parse", "--verify", f"refs/remotes/origin/{targetBranch}"], repoDir)
+        if not localExists and not remoteExists:
+            logger.error(f"[branch] Requested branch '{targetBranch}' was not found.")
+            return False, {}
+
+        checkoutArgs = ["checkout", targetBranch, "--"] if localExists else [
+            "checkout", "-b", targetBranch, "--track", f"origin/{targetBranch}"
+        ]
+        if runGit(checkoutArgs, repoDir, timeout=300) is None:
+            logger.error(
+                f"[branch] Could not checkout branch '{targetBranch}'. "
+                "Check for conflicting local changes or a branch in use by another worktree."
+            )
+            return False, {}
+        if remoteExists and not localRepository:
+            # Never rewrite history; update only when a clean fast-forward is possible.
+            if runGit(["merge", "--ff-only", f"origin/{targetBranch}"], repoDir, timeout=300) is None:
+                logger.error(
+                    f"[branch] Could not fast-forward '{targetBranch}' to origin/{targetBranch}. "
+                    "Check for local changes or divergent history."
+                )
+                return False, {}
+
+    analysisBranch = runGit(["symbolic-ref", "--short", "HEAD"], repoDir) or targetBranch
+    return True, {
+        "default_branch": defaultBranch or analysisBranch or "",
+        "analysis_branch": analysisBranch or "",
+        "branch_selection_source": "requested" if requestedBranch else "repository_default",
+    }
 
 
 def getAllContributors(repoDir: str) -> List[Dict[str, Any]]:
@@ -1416,6 +1782,65 @@ def getAllContributors(repoDir: str) -> List[Dict[str, Any]]:
     contributors.sort(key=lambda x: x["commits"], reverse=True)
     return contributors
 
+def getAllCommitsDetailed(repoDir: str) -> List[Dict[str, Any]]:
+    """
+    Return one row per commit with hash, author, email, date, message,
+    and whether it's 'meaningful'.
+    Merge commits are always marked not-meaningful, matching the
+    --no-merges logic used for meaningful_commit_count in Stage 0.
+    """
+    FIELD_SEP = "\x1f"
+    RECORD_SEP = "\x1e"
+    fmt = f"%H{FIELD_SEP}%an{FIELD_SEP}%ae{FIELD_SEP}%ci{FIELD_SEP}%P{FIELD_SEP}%D{FIELD_SEP}%B{RECORD_SEP}"
+
+    # Traverse every fetched reference.  This includes commits which are not
+    # reachable from the currently checked-out branch while remaining honest
+    # about history which was never fetched or is no longer reachable.
+    raw = runGit(["log", "--all", f"--format={fmt}"], repoDir, timeout=300)
+    if not raw:
+        return []
+
+    trivial = re.compile(
+        r"^(wip|fix|fixup!|squash!|update|commit|temp|tmp|test|merge|revert|bump)[\s\.\!]*$",
+        re.IGNORECASE,
+    )
+
+    commits = []
+    skipped = 0
+    for record in raw.split(RECORD_SEP):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split(FIELD_SEP)
+        if len(parts) != 7:
+            skipped += 1
+            continue
+        commitHash, author, email, date, parents, refs, message = parts
+        message = message.strip()
+        subject = message.splitlines()[0] if message else ""
+        isMergeCommit = len(parents.strip().split()) > 1
+        isMeaningful = (
+            not isMergeCommit
+            and len(subject) > 10
+            and not trivial.match(subject)
+        )
+
+        commits.append({
+            "hash": commitHash,
+            "author": author.strip(),
+            "email": email.strip(),
+            "date": date.strip(),
+            "message": message,
+            "parents": [value for value in parents.strip().split() if value],
+            "refs": [value.strip() for value in refs.split(",") if value.strip()],
+            "is_merge": isMergeCommit,
+            "meaningful": "Yes" if isMeaningful else "No",
+        })
+
+    if skipped:
+        logger.warning(f"[getAllCommitsDetailed] Skipped {skipped} malformed commit record(s).")
+
+    return commits
 
 def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
     """
@@ -1442,6 +1867,8 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
         },
         "branch_count": 0,
         "default_branch": None,
+        "analysis_branch": None,
+        "branch_selection_source": None,
     }
 
     # Quick sanity-check: is this a git repo?
@@ -1456,7 +1883,7 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
     if raw and raw.isdigit():
         result["commit_count"] = int(raw)
 
-    raw = runGit(["log", "--all", "--format=%ae"], repoDir)
+    raw = runGit(["log", "HEAD", "--format=%ae"], repoDir)
     if raw:
         emails = {e.strip().lower() for e in raw.splitlines() if e.strip()}
         result["unique_contributors"] = len(emails)
@@ -1464,7 +1891,7 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
     tagsRaw = runGit(["tag"], repoDir)
     result["tag_count"] = len(tagsRaw.splitlines()) if tagsRaw else 0
 
-    rawTs = runGit(["log", "--all", "--format=%at"], repoDir)
+    rawTs = runGit(["log", "HEAD", "--format=%at"], repoDir)
     if rawTs:
         tsList = []
         for line in rawTs.splitlines():
@@ -1481,9 +1908,9 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
             result["last_update"] = lastDt.strftime("%Y-%m-%d")
 
             delta = lastDt - firstDt
-            result["active_span_months"] = round(delta.days / 30.44, 1)
+            result["active_span_months"] = max(1, round(delta.days / 30.44, 1))
 
-    rawMsgs = runGit(["log", "--all", "--format=%s"], repoDir)
+    rawMsgs = runGit(["log", "HEAD", "--format=%s"], repoDir)
     if rawMsgs:
         msgs = [m.strip() for m in rawMsgs.splitlines() if m.strip()]
         trivial = re.compile(
@@ -1498,14 +1925,14 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
         )
         result["total_commits_sampled"] = len(msgs)
 
-    rawMerge = runGit(["log", "--all", "--merges", "--format=%H"], repoDir)
+    rawMerge = runGit(["log", "HEAD", "--merges", "--format=%H"], repoDir)
     if rawMerge:
         result["history_integrity"]["has_merge_commits"] = bool(rawMerge.strip())
         result["history_integrity"]["merge_commit_count"] = len(
             [h for h in rawMerge.splitlines() if h.strip()]
         )
 
-    rawNonmerge = runGit(["log", "--all", "--no-merges", "--format=%s"], repoDir)
+    rawNonmerge = runGit(["log", "HEAD", "--no-merges", "--format=%s"], repoDir)
     result["meaningful_commit_count"] = 0
     if rawNonmerge:
         nonmergeMsgs = [m.strip() for m in rawNonmerge.splitlines() if m.strip()]
@@ -1518,7 +1945,7 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
         )
 
     if result["commit_count"] > 0:
-        rawDates = runGit(["log", "--all", "--format=%ci"], repoDir)
+        rawDates = runGit(["log", "HEAD", "--format=%ci"], repoDir)
         if rawDates:
             dates = [line[:10] for line in rawDates.splitlines() if line.strip()]
             uniqueDays = len(set(dates))
@@ -1543,6 +1970,7 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
     result["history_integrity"]["appears_intact"] = integrityOk
 
     result["all_contributors"] = getAllContributors(repoDir)
+    result["all_commits_detailed"] = getAllCommitsDetailed(repoDir)
 
     rawBranches = runGit(["branch", "-a"], repoDir)
     if rawBranches:
@@ -1563,7 +1991,11 @@ def runStage0GitAnalysis(repoDir: str) -> Dict[str, Any]:
         result["branch_count"] = len(uniqueBranches)
 
     rawHead = runGit(["symbolic-ref", "--short", "HEAD"], repoDir)
-    if rawHead:
+    result["analysis_branch"] = rawHead
+    remoteHead = runGit(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoDir)
+    if remoteHead and "/" in remoteHead:
+        result["default_branch"] = remoteHead.split("/", 1)[1]
+    else:
         result["default_branch"] = rawHead
 
     return result
@@ -1600,7 +2032,7 @@ def computeLanguageBreakdown(
 
     breakdown = {}
     for lang, loc in sorted(langLoc.items(), key=lambda x: -x[1]):
-        pct = round(loc / totalLoc * 100, 2) if total_loc else 0.0
+        pct = round(loc / totalLoc * 100, 2) if totalLoc else 0.0
         breakdown[lang] = {
             "loc":   loc,
             "files": langFiles[lang],
@@ -2333,13 +2765,18 @@ def fetchGitLabMergeRequests(domain: str, project_path: str, token: Optional[str
 
         for mr in data:
             state = mr.get("state")
-            mapped_state = "open" if state == "opened" else "closed"
+            lifecycle_status = "open" if state == "opened" else ("merged" if state == "merged" else "closed")
             merged_at = mr.get("merged_at")
 
-            mr_dict = {
+            mr_dict = dict(mr)
+            mr_dict.update({
+                "provider": "gitlab",
+                "provider_state": state,
+                "lifecycle_status": lifecycle_status,
                 "number": mr.get("iid"),
                 "title": mr.get("title"),
-                "state": mapped_state,
+                "body": mr.get("description"),
+                "state": "open" if lifecycle_status == "open" else "closed",
                 "created_at": mr.get("created_at"),
                 "updated_at": mr.get("updated_at"),
                 "closed_at": mr.get("closed_at"),
@@ -2352,7 +2789,12 @@ def fetchGitLabMergeRequests(domain: str, project_path: str, token: Optional[str
                 "comments": None,
                 "review_comments": None,
                 "commits": None,
-            }
+                "head_sha": mr.get("sha"),
+                "merge_commit_sha": mr.get("merge_commit_sha"),
+                "squash_commit_sha": mr.get("squash_commit_sha"),
+                "source_branch": mr.get("source_branch"),
+                "target_branch": mr.get("target_branch"),
+            })
             mr_list.append(mr_dict)
 
         next_page = response.headers.get("X-Next-Page")
@@ -2380,7 +2822,17 @@ def runGitLabMrAnalysis(
         "open_pr_count": 0,
         "closed_pr_count": 0,
         "merged_pr_count": 0,
+        "total_pr_comments_count": 0,
+        "open_pr_comments_count": 0,
+        "closed_pr_comments_count": 0,
+        "merged_pr_comments_count": 0,
+        "total_pr_review_comment_count": 0,
+        "open_pr_review_comment_count": 0,
+        "closed_pr_review_comment_count": 0,
+        "merged_pr_review_comment_count": 0,
         "github_pr_analysis_available": False,
+        "pr_content_tokens": _emptyPrTokenMetrics(),
+        "pr_content_tokens_lexical": _emptyPrTokenMetrics(),
     }
 
     env_token = os.getenv("GITLAB_TOKEN") or os.getenv("GL_TOKEN")
@@ -2398,6 +2850,14 @@ def runGitLabMrAnalysis(
 
         metrics = calculatePrMetrics(prs)
         metrics["github_pr_analysis_available"] = True
+        metrics["_merge_commit_identities"] = buildMergeCommitIdentities(prs)
+        metrics.update(enrichGitLabPrContentTokens(
+            prs, domain, project_path, final_token
+        ))
+        metrics.update(calculatePrCommentMetrics(prs))
+        metrics.update(extractGitLabIssuesAndCi(
+            domain, project_path, final_token, outputDir, repo_name
+        ))
 
         sanitized_name = sanitizeFilename(repo_name)
         dumpPrJsonFiles(outputDir, sanitized_name, prs)
@@ -2475,32 +2935,558 @@ def enrichViaGitLabApi(
     except Exception as exc:
         return {"available": False, "reason": str(exc)}
 
+def extractBitbucketRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[str, str, str, bool]]:
+    """
+    Detect Bitbucket domain, workspace/project, and repo slug from inputTarget URL
+    or local git configuration.
+    Returns: (domain, workspace_or_project, repo_slug, is_cloud)
+    """
+    import urllib.parse
+
+    for candidate in [inputTarget, targetDir]:
+        if not candidate:
+            continue
+
+        # 1. Handle HTTP/HTTPS URLs (including ones with embedded tokens/passwords)
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            try:
+                parsed = urllib.parse.urlparse(candidate)
+                hostname = parsed.hostname
+                if hostname and "bitbucket" in hostname.lower():
+                    is_cloud = hostname.lower() == "bitbucket.org"
+                    path = parsed.path.strip("/")
+                    if path.endswith(".git"):
+                        path = path[:-4]
+
+                    # Bitbucket Server/Data Center paths look like:
+                    #   scm/PROJECT/repo.git
+                    #   projects/PROJECT/repos/repo/browse
+                    path = re.sub(r"^scm/", "", path)
+                    path = re.sub(r"^projects/([^/]+)/repos/([^/]+).*$", r"\1/\2", path)
+
+                    parts = path.split("/")
+                    if len(parts) >= 2:
+                        workspace = parts[0]
+                        repo = parts[1]
+                        return hostname, workspace, repo, is_cloud
+            except Exception:
+                pass
+
+        # 2. Handle SSH and other Git URL formats
+        #    Cloud:  git@bitbucket.org:workspace/repo.git
+        #    Server: ssh://git@bitbucket.company.com:7999/PROJECT/repo.git
+        else:
+            if "bitbucket" in candidate.lower():
+                try:
+                    stripped = candidate
+                    if stripped.startswith("ssh://"):
+                        stripped = stripped[len("ssh://"):]
+
+                    if "@" in stripped:
+                        host_and_path = stripped.split("@", 1)[1]
+                    else:
+                        host_and_path = stripped
+
+                    # host_and_path is one of:
+                    #   bitbucket.org:workspace/repo.git
+                    #   bitbucket.company.com:7999/PROJECT/repo.git
+                    m = re.split(r'[:/]', host_and_path, 1)
+                    if len(m) == 2:
+                        domain = m[0]
+                        rest = m[1]
+
+                        # Strip a leading port number if present (server SSH URLs)
+                        rest = re.sub(r'^\d+/', '', rest)
+
+                        if rest.endswith(".git"):
+                            rest = rest[:-4]
+
+                        rest = re.sub(r"^scm/", "", rest)
+
+                        parts = rest.split("/")
+                        if len(parts) >= 2:
+                            is_cloud = domain.lower() == "bitbucket.org"
+                            workspace = parts[0]
+                            repo = parts[1]
+                            return domain, workspace, repo, is_cloud
+                except Exception:
+                    pass
+
+    # 3. Check git config remote origin as a fallback
+    if os.path.isdir(os.path.join(targetDir, ".git")):
+        remote_url = runGit(["config", "--get", "remote.origin.url"], targetDir)
+        if remote_url:
+            return extractBitbucketRepoInfo(targetDir, remote_url)
+
+    return None
+
+def _bitbucketAuthHeaders(token: Optional[str], is_cloud: bool) -> dict:
+    """
+    Builds auth headers for Bitbucket API calls.
+    Cloud: Bearer token (Repository/Workspace access token) works for both
+           read scopes; falls back to no auth for public repos.
+    Server/Data Center: Bearer token (Personal Access Token).
+    """
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def callBitbucketApi(url: str, headers: dict, params: dict = None) -> Optional[Any]:
+    """
+    Executes a Bitbucket API request with rate limit handling and retries.
+    """
+    import requests
+    global BITBUCKET_RATE_PAUSE_UNTIL
+    retries = 0
+    max_retries = 8
+    backoff = 2
+    while retries < max_retries:
+        with BITBUCKET_RATE_LOCK:
+            pause_for = max(0.0, BITBUCKET_RATE_PAUSE_UNTIL - time.monotonic())
+        if pause_for > 0:
+            time.sleep(pause_for)
+
+        try:
+            session = getattr(BITBUCKET_HTTP, "session", None)
+            if session is None:
+                session = requests.Session()
+                BITBUCKET_HTTP.session = session
+
+            response = session.get(url, headers=headers, params=params, timeout=60)
+            if response.status_code == 200:
+                return response
+            elif response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    base_sleep = max(1.0, float(retry_after)) if retry_after else None
+                except (TypeError, ValueError):
+                    base_sleep = None
+                if base_sleep is None:
+                    # Bitbucket sometimes omits Retry-After on repository-level
+                    # diff/diffstat throttles. A short exponential retry keeps
+                    # colliding with the active rate-limit window, so use a
+                    # conservative cooldown when the server gives no value.
+                    base_sleep = min(300, 60 * (2 ** retries))
+                sleep_time = base_sleep + random.uniform(0.5, 1.5)
+                with BITBUCKET_RATE_LOCK:
+                    BITBUCKET_RATE_PAUSE_UNTIL = max(
+                        BITBUCKET_RATE_PAUSE_UNTIL,
+                        time.monotonic() + sleep_time,
+                    )
+                logger.warning(f"Bitbucket API rate limit hit for {url}. Sleeping for {sleep_time:.2f} seconds...")
+                time.sleep(sleep_time)
+                retries += 1
+            elif response.status_code in [500, 502, 503, 504]:
+                sleep_time = min(60, backoff ** retries) + random.uniform(0.5, 1.5)
+                logger.warning(f"Bitbucket API server error ({response.status_code}) for {url}. Retrying in {sleep_time:.2f} seconds...")
+                time.sleep(sleep_time)
+                retries += 1
+            elif response.status_code in [401, 403]:
+                logger.error(f"Bitbucket API auth failed ({response.status_code}): {response.text}")
+                return None
+            else:
+                logger.error(f"Bitbucket API request failed with status code {response.status_code}: {response.text}")
+                return None
+        except requests.RequestException as e:
+            if isinstance(e, requests.ConnectionError):
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                BITBUCKET_HTTP.session = None
+            sleep_time = min(60, backoff ** retries) + random.uniform(0.5, 1.5)
+            logger.warning(
+                f"Network error during Bitbucket API call to {url}: {e}. "
+                f"Retrying in {sleep_time:.2f} seconds ({retries + 1}/{max_retries})..."
+            )
+            time.sleep(sleep_time)
+            retries += 1
+    return None
+
+
+def enrichViaBitbucketApi(
+    domain: str,
+    workspace: str,
+    repo: str,
+    token: Optional[str],
+    is_cloud: bool,
+) -> Dict[str, Any]:
+    """
+    Optional Bitbucket API enrichment. Branches between Bitbucket Cloud (API v2.0)
+    and Bitbucket Server/Data Center (REST API 1.0), which have different
+    endpoints, auth, and response shapes.
+    """
+    import urllib.parse
+    headers = _bitbucketAuthHeaders(token, is_cloud)
+
+    if is_cloud:
+        encoded_workspace = urllib.parse.quote(workspace, safe="")
+        encoded_repo = urllib.parse.quote(repo, safe="")
+        url = f"https://api.bitbucket.org/2.0/repositories/{encoded_workspace}/{encoded_repo}"
+
+        response = callBitbucketApi(url, headers)
+        if not response:
+            return {"available": False, "reason": "Request failed"}
+
+        try:
+            data = response.json()
+
+            created_at_str = "N/A"
+            if data.get("created_on"):
+                try:
+                    created_at_str = data.get("created_on").split("T")[0]
+                except Exception:
+                    pass
+
+            pushed_at_str = "N/A"
+            if data.get("updated_on"):
+                try:
+                    pushed_at_str = data.get("updated_on").split("T")[0]
+                except Exception:
+                    pass
+
+            size_bytes = data.get("size", 0)
+            size_kb = size_bytes // 1024 if size_bytes else 0
+
+            return {
+                "available":       True,
+                "full_name":       data.get("full_name"),
+                "owner":           workspace,
+                "description":     data.get("description"),
+                "is_private":      data.get("is_private", False),
+                "is_fork":         data.get("parent") is not None,
+                "stars":           None,   # Bitbucket Cloud has no star count
+                "forks":           None,   # requires separate /forks endpoint
+                "open_issues":     None,   # requires separate /issues endpoint
+                "topics":          [],     # Bitbucket has no topics/tags concept
+                "default_branch":  (data.get("mainbranch") or {}).get("name"),
+                "created_at":      created_at_str,
+                "pushed_at":       pushed_at_str,
+                "size_kb":         size_kb,
+                "license":         None,   # not exposed by the repo endpoint
+                "language":        data.get("language"),
+                "subscribers":     None,
+                "visibility":      "private" if data.get("is_private") else "public",
+            }
+        except Exception as exc:
+            return {"available": False, "reason": str(exc)}
+
+    else:
+        # Bitbucket Server / Data Center — REST API 1.0
+        encoded_project = urllib.parse.quote(workspace, safe="")
+        encoded_repo = urllib.parse.quote(repo, safe="")
+        url = f"https://{domain}/rest/api/1.0/projects/{encoded_project}/repos/{encoded_repo}"
+
+        response = callBitbucketApi(url, headers)
+        if not response:
+            return {"available": False, "reason": "Request failed"}
+
+        try:
+            data = response.json()
+
+            default_branch = None
+            try:
+                branch_url = f"{url}/default-branch"
+                branch_resp = callBitbucketApi(branch_url, headers)
+                if branch_resp:
+                    default_branch = branch_resp.json().get("displayId")
+            except Exception:
+                pass
+
+            is_public = data.get("public", False)
+
+            return {
+                "available":       True,
+                "full_name":       f"{workspace}/{data.get('slug', repo)}",
+                "owner":           workspace,
+                "description":     data.get("description"),
+                "is_private":      not is_public,
+                "is_fork":         data.get("origin") is not None,
+                "stars":           None,
+                "forks":           None,
+                "open_issues":     None,
+                "topics":          [],
+                "default_branch":  default_branch,
+                "created_at":      "N/A",   # not exposed by Server API
+                "pushed_at":       "N/A",
+                "size_kb":         None,    # requires separate size endpoint
+                "license":         None,
+                "language":        None,
+                "subscribers":     None,
+                "visibility":      "public" if is_public else "private",
+            }
+        except Exception as exc:
+            return {"available": False, "reason": str(exc)}
+
+
+def fetchBitbucketPullRequests(
+    domain: str,
+    workspace: str,
+    repo: str,
+    token: Optional[str],
+    is_cloud: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all Pull Requests for the repository using the Bitbucket API, paginating.
+    Cloud and Server differ significantly in pagination and state filtering,
+    so this branches on is_cloud.
+    """
+    import urllib.parse
+    pr_list = []
+    headers = _bitbucketAuthHeaders(token, is_cloud)
+    logger.info("Fetching Bitbucket Pull Requests...")
+
+    if is_cloud:
+        encoded_workspace = urllib.parse.quote(workspace, safe="")
+        encoded_repo = urllib.parse.quote(repo, safe="")
+        base_url = f"https://api.bitbucket.org/2.0/repositories/{encoded_workspace}/{encoded_repo}/pullrequests"
+
+        # Bitbucket Cloud doesn't support state=ALL in one call — must query
+        # each state separately and merge the results.
+        for state in ("OPEN", "MERGED", "DECLINED", "SUPERSEDED"):
+            url = base_url
+            params = {"state": state, "pagelen": 50}
+
+            while url:
+                response = callBitbucketApi(url, headers, params)
+                if not response:
+                    break
+
+                data = response.json()
+                values = data.get("values", [])
+                if not values:
+                    break
+
+                for pr in values:
+                    if not isinstance(pr, dict):
+                        logger.warning("Skipping Bitbucket PR with an invalid response object.")
+                        continue
+
+                    source = pr.get("source")
+                    destination = pr.get("destination")
+                    if not isinstance(source, dict) or not isinstance(destination, dict):
+                        logger.warning(
+                            "Skipping Bitbucket PR #%s because its source or destination "
+                            "branch/commit is missing or inaccessible.",
+                            pr.get("id"),
+                        )
+                        continue
+
+                    source_commit = source.get("commit")
+                    destination_commit = destination.get("commit")
+                    source_branch = source.get("branch")
+                    destination_branch = destination.get("branch")
+                    source_commit_hash = source_commit.get("hash") if isinstance(source_commit, dict) else None
+                    destination_commit_hash = destination_commit.get("hash") if isinstance(destination_commit, dict) else None
+                    source_branch_name = source_branch.get("name") if isinstance(source_branch, dict) else None
+                    destination_branch_name = destination_branch.get("name") if isinstance(destination_branch, dict) else None
+                    if not all((source_commit_hash, destination_commit_hash,
+                                source_branch_name, destination_branch_name)):
+                        logger.warning(
+                            "Skipping Bitbucket PR #%s because its source or destination "
+                            "branch/commit is missing or inaccessible.",
+                            pr.get("id"),
+                        )
+                        continue
+
+                    provider_state = pr.get("state")
+                    lifecycle_status = "open" if provider_state == "OPEN" else ("merged" if provider_state == "MERGED" else "closed")
+
+                    merged_at = pr.get("updated_on") if pr.get("state") == "MERGED" else None
+
+                    pr_dict = dict(pr)
+                    pr_dict.update({
+                        "provider": "bitbucket",
+                        "provider_state": provider_state,
+                        "lifecycle_status": lifecycle_status,
+                        "number": pr.get("id"),
+                        "title": pr.get("title"),
+                        "body": pr.get("description"),
+                        "state": "open" if lifecycle_status == "open" else "closed",
+                        "created_at": pr.get("created_on"),
+                        "updated_at": pr.get("updated_on"),
+                        "closed_at": pr.get("updated_on") if pr.get("state") in ("MERGED", "DECLINED") else None,
+                        "merged_at": merged_at,
+                        "user": {"login": (pr.get("author") or {}).get("nickname")} if pr.get("author") else None,
+                        "html_url": (pr.get("links", {}).get("html") or {}).get("href"),
+                        "additions": None,
+                        "deletions": None,
+                        "changed_files": None,
+                        "comments": pr.get("comment_count"),
+                        "review_comments": None,
+                        "commits": None,
+                        "head_sha": source_commit_hash,
+                        "base_sha": destination_commit_hash,
+                        "source_branch": source_branch_name,
+                        "target_branch": destination_branch_name,
+                    })
+                    pr_list.append(pr_dict)
+                    logger.info(
+                        "Fetched Bitbucket PR #%s metadata successfully.",
+                        pr_dict.get("number"),
+                    )
+
+                # Cloud pagination gives a full "next" URL directly
+                url = data.get("next")
+                params = None  # already encoded in the next URL
+
+    else:
+        # Bitbucket Server / Data Center — REST API 1.0, start/limit pagination
+        encoded_project = urllib.parse.quote(workspace, safe="")
+        encoded_repo = urllib.parse.quote(repo, safe="")
+        url = f"https://{domain}/rest/api/1.0/projects/{encoded_project}/repos/{encoded_repo}/pull-requests"
+
+        start = 0
+        limit = 100
+        while True:
+            params = {"state": "ALL", "start": start, "limit": limit}
+            response = callBitbucketApi(url, headers, params)
+            if not response:
+                break
+
+            data = response.json()
+            values = data.get("values", [])
+            if not values:
+                break
+
+            for pr in values:
+                state = pr.get("state")  # OPEN, MERGED, DECLINED
+                lifecycle_status = "open" if state == "OPEN" else ("merged" if state == "MERGED" else "closed")
+
+                created_ms = pr.get("createdDate")
+                updated_ms = pr.get("updatedDate")
+                closed_ms = pr.get("closedDate")
+
+                def _ms_to_iso(ms):
+                    if not ms:
+                        return None
+                    try:
+                        return datetime.datetime.utcfromtimestamp(ms / 1000).isoformat() + "Z"
+                    except Exception:
+                        return None
+
+                pr_dict = dict(pr)
+                from_ref = pr.get("fromRef") or {}
+                to_ref = pr.get("toRef") or {}
+                pr_dict.update({
+                    "provider": "bitbucket",
+                    "provider_state": state,
+                    "lifecycle_status": lifecycle_status,
+                    "number": pr.get("id"),
+                    "title": pr.get("title"),
+                    "body": pr.get("description"),
+                    "state": "open" if lifecycle_status == "open" else "closed",
+                    "created_at": _ms_to_iso(created_ms),
+                    "updated_at": _ms_to_iso(updated_ms),
+                    "closed_at": _ms_to_iso(closed_ms) if state in ("MERGED", "DECLINED") else None,
+                    "merged_at": _ms_to_iso(closed_ms) if state == "MERGED" else None,
+                    "user": {"login": (pr.get("author", {}).get("user") or {}).get("name")} if pr.get("author") else None,
+                    "html_url": next(
+                        (l.get("href") for l in pr.get("links", {}).get("self", [])), None
+                    ) if pr.get("links") else None,
+                    "additions": None,
+                    "deletions": None,
+                    "changed_files": None,
+                    "comments": None,
+                    "review_comments": None,
+                    "commits": None,
+                    "head_sha": from_ref.get("latestCommit") or from_ref.get("latestChangeset"),
+                    "base_sha": to_ref.get("latestCommit") or to_ref.get("latestChangeset"),
+                    "source_branch": from_ref.get("displayId"),
+                    "target_branch": to_ref.get("displayId"),
+                })
+                pr_list.append(pr_dict)
+
+            if data.get("isLastPage", True):
+                break
+            start = data.get("nextPageStart", start + limit)
+
+    return pr_list
+
+
+def runBitbucketPrAnalysis(
+    targetDir: str,
+    inputTarget: str,
+    token: Optional[str],
+    outputDir: str,
+) -> Dict[str, Any]:
+    """
+    Bitbucket PR analytics module (Stage 0.5/Enrichment stage).
+    """
+    defaults = {
+        "total_pr_count": 0,
+        "open_pr_count": 0,
+        "closed_pr_count": 0,
+        "merged_pr_count": 0,
+        "total_pr_comments_count": 0,
+        "open_pr_comments_count": 0,
+        "closed_pr_comments_count": 0,
+        "merged_pr_comments_count": 0,
+        "total_pr_review_comment_count": 0,
+        "open_pr_review_comment_count": 0,
+        "closed_pr_review_comment_count": 0,
+        "merged_pr_review_comment_count": 0,
+        "github_pr_analysis_available": False,
+        "pr_content_tokens": _emptyPrTokenMetrics(),
+        "pr_content_tokens_lexical": _emptyPrTokenMetrics(),
+    }
+
+    env_token = os.getenv("BITBUCKET_TOKEN") or os.getenv("BB_TOKEN")
+    final_token = env_token or token
+
+    info = extractBitbucketRepoInfo(targetDir, inputTarget)
+    if not info:
+        logger.info("Not a Bitbucket repository or remote URL. Skipping PR analysis.")
+        return defaults
+
+    domain, workspace, repo_name, is_cloud = info
+
+    if not final_token:
+        logger.warning(
+            "Bitbucket token missing. Please set BITBUCKET_TOKEN or BB_TOKEN env variables "
+            "(or pass --bitbucket-token) to enable Bitbucket PR analytics."
+        )
+        return defaults
+
+    try:
+        prs = fetchBitbucketPullRequests(domain, workspace, repo_name, final_token, is_cloud)
+
+        metrics = calculatePrMetrics(prs)
+        metrics["github_pr_analysis_available"] = True
+        metrics["_merge_commit_identities"] = buildMergeCommitIdentities(prs)
+        metrics.update(enrichBitbucketPrContentTokens(
+            prs, domain, workspace, repo_name, final_token, is_cloud, outputDir
+        ))
+        metrics.update(calculatePrCommentMetrics(prs))
+        metrics.update(extractBitbucketIssuesAndCi(
+            domain, workspace, repo_name, final_token, is_cloud, prs, outputDir
+        ))
+
+        sanitized_name = sanitizeFilename(repo_name)
+        dumpPrJsonFiles(outputDir, sanitized_name, prs)
+
+        return metrics
+
+    except Exception as e:
+        logger.warning(f"Bitbucket PR analysis failed: {e}. Falling back to default metrics.")
+        return defaults
 
 def extractGitHubRepoInfo(targetDir: str, inputTarget: str) -> Optional[Tuple[str, str]]:
     """
     Detect GitHub repository owner and name from inputTarget URL or local git configuration.
     """
-    for candidate in [inputTarget, targetDir]:
-        if candidate:
-            m = re.search(r"github\.com[/:]([^/]+)/([^/]+)", candidate)
-            if m:
-                owner = m.group(1)
-                repo = m.group(2)
-                if repo.endswith(".git"):
-                    repo = repo[:-4]
-                return owner, repo
+    parsed_name = github_name(inputTarget)
+    if parsed_name:
+        return tuple(parsed_name.split("/", 1))
 
     # If not found directly, check git config remote origin
-    if os.path.isdir(os.path.join(targetDir, ".git")):
+    if os.path.exists(os.path.join(targetDir, ".git")):
         remote_url = runGit(["config", "--get", "remote.origin.url"], targetDir)
-        if remote_url:
-            m = re.search(r"github\.com[/:]([^/]+)/([^/]+)", remote_url)
-            if m:
-                owner = m.group(1)
-                repo = m.group(2)
-                if repo.endswith(".git"):
-                    repo = repo[:-4]
-                return owner, repo
+        parsed_name = github_name(remote_url or "")
+        if parsed_name:
+            return tuple(parsed_name.split("/", 1))
     return None
 
 
@@ -2522,7 +3508,7 @@ def getCoreRateLimit(g: Github):
     return None
 
 
-def handleRateLimit(g: Github):
+def handleRateLimit(g: Github, minimum_remaining: int = 10):
     """
     Checks the current GitHub rate limit and sleeps if it is close to exhausted.
     """
@@ -2530,7 +3516,7 @@ def handleRateLimit(g: Github):
     if core is None:
         return
     try:
-        if core.remaining < 10:
+        if core.remaining < minimum_remaining:
             reset_val = core.reset
             if hasattr(reset_val, "timestamp"):
                 reset_time = reset_val.timestamp()
@@ -2612,8 +3598,12 @@ def fetchPullRequests(g: Github, repo) -> List[Dict[str, Any]]:
             pass
 
         pr_dict.update({
+            "provider": "github",
+            "provider_state": pr.state,
+            "lifecycle_status": "merged" if pr.merged_at else pr.state,
             "number": pr.number,
             "title": pr.title,
+            "body": pr.body,
             "state": pr.state,
             "created_at": pr.created_at.isoformat() if pr.created_at else None,
             "updated_at": pr.updated_at.isoformat() if pr.updated_at else None,
@@ -2621,56 +3611,102 @@ def fetchPullRequests(g: Github, repo) -> List[Dict[str, Any]]:
             "merged_at": pr.merged_at.isoformat() if pr.merged_at else None,
             "user": {"login": pr.user.login} if pr.user else None,
             "html_url": pr.html_url,
+            "head_sha": getattr(getattr(pr, "head", None), "sha", None),
+            "base_sha": getattr(getattr(pr, "base", None), "sha", None),
+            "merge_commit_sha": getattr(pr, "merge_commit_sha", None),
+            "source_branch": getattr(getattr(pr, "head", None), "ref", None),
+            "target_branch": getattr(getattr(pr, "base", None), "ref", None),
         })
 
-        # Detailed attributes: additions, deletions, changed_files, commits, comments, review_comments
-        try:
-            if count % 100 == 0:
-                try:
-                    rate_limit = g.get_rate_limit().core
-                    remaining = rate_limit.remaining
-                except Exception:
-                    pass
-
-            # If remaining rate limit is low (e.g. < 150), skip detailed fetch
-            if remaining < 150:
-                pr_dict.update({
-                    "additions": None,
-                    "deletions": None,
-                    "changed_files": None,
-                    "comments": getattr(pr, "comments", None),
-                    "review_comments": getattr(pr, "review_comments", None),
-                    "commits": None,
-                })
-            else:
-                def _fetch_details():
-                    # Accessing additions triggers the detailed GET request
-                    return (pr.additions, pr.deletions, pr.changed_files, pr.commits, pr.comments, pr.review_comments)
-
-                additions, deletions, changed_files, commits, comments, review_comments = callWithRetry(
-                    g, _fetch_details)
-                pr_dict.update({
-                    "additions": additions,
-                    "deletions": deletions,
-                    "changed_files": changed_files,
-                    "comments": comments,
-                    "review_comments": review_comments,
-                    "commits": commits,
-                })
-        except Exception:
-            # Fallback to None/safe defaults for detailed fields on error
-            pr_dict.update({
-                "additions": None,
-                "deletions": None,
-                "changed_files": None,
-                "comments": getattr(pr, "comments", None),
-                "review_comments": getattr(pr, "review_comments", None),
-                "commits": None,
-            })
+        # Avoid one extra API request per PR here. Content enrichment below
+        # fetches only the data needed for token counting, concurrently.
+        pr_dict.update({
+            "additions": pr_dict.get("additions"),
+            "deletions": pr_dict.get("deletions"),
+            "changed_files": pr_dict.get("changed_files"),
+            "comments": pr_dict.get("comments"),
+            "review_comments": pr_dict.get("review_comments"),
+            "commits": pr_dict.get("commits"),
+        })
 
         pr_list.append(pr_dict)
 
     return pr_list
+
+
+def getPrVelocityMergedAt(pr):
+    """Select the oldest valid Merged At date in any provider's description.
+
+    Fall back to the API date only when no Merged At label is present. An
+    invalid original date must not silently become the migration's merge date.
+    """
+    dates = []
+    found_label = False
+    for field in ("body", "description"):
+        description = str(pr.get(field) or "")
+        # Support plain text, Markdown emphasis/code, and HTML metadata labels.
+        description = re.sub(r"<[^>]+>", "", description)
+        description = description.replace("&nbsp;", " ")
+        description = re.sub(r"[*_`]", "", description)
+        for match in re.finditer(r"\bMerged\s+At\s*:\s*(\S+)?", description, re.IGNORECASE):
+            found_label = True
+            try:
+                merged = datetime.datetime.fromisoformat((match.group(1) or "").replace("Z", "+00:00"))
+                if merged.tzinfo is None:
+                    merged = merged.replace(tzinfo=datetime.timezone.utc)
+                dates.append(merged)
+            except ValueError:
+                continue
+    if dates:
+        return min(dates).isoformat()
+    if found_label:
+        return None
+    return pr.get("merged_at")
+
+
+def calculate_pr_velocity_profile(prs):
+    """Calculate 1-week and 1-month PR velocity percentages and blacklist status.
+
+    Only merged PRs are considered, both for the total (denominator) and for
+    the recent-activity counts. Recency uses the oldest valid Merged At date in
+    each PR's body/description, falling back to the API merged_at when absent.
+    """
+    merged_prs = [pr for pr in prs if getPrLifecycleStatus(pr) == "merged"]
+
+    if not merged_prs:
+        return "1w:0.00% / 1m:0.00%", "OK", 0.0, 0.0
+
+    total = len(merged_prs)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    week_ago = now - datetime.timedelta(days=7)
+    month_ago = now - datetime.timedelta(days=30)
+
+    week_count = 0
+    month_count = 0
+
+    for pr in merged_prs:
+        merged_str = getPrVelocityMergedAt(pr)
+        if not merged_str:
+            continue
+        try:
+            merged_str = str(merged_str).replace("Z", "+00:00")
+            merged = datetime.datetime.fromisoformat(merged_str)
+            if merged.tzinfo is None:
+                merged = merged.replace(tzinfo=datetime.timezone.utc)
+            if merged >= week_ago:
+                week_count += 1
+            if merged >= month_ago:
+                month_count += 1
+        except Exception:
+            continue
+
+    week_pct = (week_count / total) * 100
+    month_pct = (month_count / total) * 100
+
+    profile = f"1w:{week_pct:.2f}% / 1m:{month_pct:.2f}%"
+    status = "BLACKLISTED" if week_pct >= 30 or month_pct >= 30 else "OK"
+
+    return profile, status, week_pct, month_pct
 
 
 def calculatePrMetrics(prs: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2683,15 +3719,16 @@ def calculatePrMetrics(prs: List[Dict[str, Any]]) -> Dict[str, Any]:
     merged_pr_count = 0
 
     for pr in prs:
-        state = pr.get("state")
-        merged_at = pr.get("merged_at")
+        status = getPrLifecycleStatus(pr)
 
-        if state == "open":
+        if status == "open":
             open_pr_count += 1
-        elif state == "closed":
+        elif status == "merged":
+            merged_pr_count += 1
+        elif status == "closed":
             closed_pr_count += 1
-            if merged_at is not None:
-                merged_pr_count += 1
+
+    pr_velocity_profile, blacklist_status, _, _ = calculate_pr_velocity_profile(prs)
 
     return {
         "total_pr_count": total_pr_count,
@@ -2699,6 +3736,798 @@ def calculatePrMetrics(prs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "closed_pr_count": closed_pr_count,
         "merged_pr_count": merged_pr_count,
         "github_pr_analysis_available": True,
+        "pr_velocity_profile": pr_velocity_profile,
+        "blacklist_status": blacklist_status,
+    }
+
+
+def buildMergeCommitIdentities(prs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Build SHA/PR-number lookups for provider usernames on merge commits."""
+    bySha = {}
+    byNumber = {}
+    for pr in prs:
+        user = pr.get("user") or {}
+        username = user.get("login") or user.get("username") or user.get("name")
+        number = pr.get("number")
+        if not username:
+            continue
+        identity = {"username": username, "pr_number": number,
+                    "provider": pr.get("provider")}
+        if number is not None:
+            byNumber[str(number)] = identity
+        rawMergeCommit = pr.get("merge_commit") or {}
+        candidateShas = (
+            pr.get("merge_commit_sha"), pr.get("squash_commit_sha"),
+            rawMergeCommit.get("hash") if isinstance(rawMergeCommit, dict) else None,
+        )
+        for sha in candidateShas:
+            if sha:
+                bySha[str(sha).lower()] = identity
+    return {"by_sha": bySha, "by_number": byNumber}
+
+
+def attachMergeCommitUsernames(
+    commits: List[Dict[str, Any]], identities: Dict[str, Dict[str, Any]]
+) -> None:
+    """Attach API username without replacing immutable Git author metadata."""
+    bySha = identities.get("by_sha", {})
+    byNumber = identities.get("by_number", {})
+    prPattern = re.compile(r"\b(?:pull request|merge request)\s*[#!](\d+)\b", re.IGNORECASE)
+    githubBranchPattern = re.compile(
+        r"\bmerge\s+pull\s+request\s+#(\d+)\s+from\s+([^/\s]+)/",
+        re.IGNORECASE,
+    )
+    for commit in commits:
+        identity = bySha.get(str(commit.get("hash") or "").lower())
+        source = "merge_commit_sha" if identity else None
+        if not identity:
+            match = prPattern.search(commit.get("message") or "")
+            if match:
+                identity = byNumber.get(match.group(1))
+                source = "merge_message_pr_number" if identity else None
+        if not identity:
+            match = githubBranchPattern.search(commit.get("message") or "")
+            if match:
+                identity = {"username": match.group(2), "pr_number": int(match.group(1))}
+                source = "merge_message_branch_owner"
+        commit["username"] = identity.get("username", "") if identity else ""
+        commit["pr_number"] = identity.get("pr_number", "") if identity else ""
+        commit["identity_source"] = source or "git_author_only"
+
+
+def normalizeCommitAuthorsToUsernames(commits: List[Dict[str, Any]]) -> None:
+    """
+    Make ``author`` a username consistently using aliases observed for the same
+    Git email. Preserve the original Git display name in ``author_name``.
+    """
+    usernamePattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    candidatesByEmail = defaultdict(lambda: defaultdict(int))
+
+    for commit in commits:
+        originalAuthor = str(commit.get("author") or "").strip()
+        email = str(commit.get("email") or "").strip().lower()
+        if email and usernamePattern.fullmatch(originalAuthor):
+            candidatesByEmail[email][originalAuthor] += 1
+
+    canonicalByEmail = {}
+    for email, candidates in candidatesByEmail.items():
+        canonicalByEmail[email] = max(candidates.items(), key=lambda item: (item[1], item[0]))[0]
+
+    for commit in commits:
+        originalAuthor = str(commit.get("author") or "").strip()
+        email = str(commit.get("email") or "").strip().lower()
+        commit["author_name"] = originalAuthor
+        resolvedUsername = canonicalByEmail.get(email)
+        if not resolvedUsername and usernamePattern.fullmatch(originalAuthor):
+            resolvedUsername = originalAuthor
+        # A PR author's username is a different identity and must not be used
+        # as the merge commit author's username.
+        commit["pr_author_username"] = commit.pop("username", "")
+        commit["author"] = resolvedUsername or ""
+        commit["author_identity_source"] = (
+            "git_email_alias" if email in canonicalByEmail else
+            "git_author_username" if resolvedUsername else
+            "unresolved"
+        )
+
+def _emptyPrTokenMetrics() -> Dict[str, int]:
+    return {"total": 0, "titles_bodies": 0, "discussion": 0, "commit_messages": 0}
+
+
+def countPrMetadataTokens(prs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Count provider-supplied PR title/body text without additional requests."""
+    llm = _emptyPrTokenMetrics()
+    lexical = _emptyPrTokenMetrics()
+    for pr in prs:
+        text_value = "\n".join(filter(None, (pr.get("title"), pr.get("body"))))
+        pr["llm_token_count"] = getLlmTokens(text_value)
+        pr["lexical_token_count"] = len(countLexicalTokens(text_value))
+        llm["titles_bodies"] += pr["llm_token_count"]
+        lexical["titles_bodies"] += pr["lexical_token_count"]
+    llm["total"] = llm["titles_bodies"]
+    lexical["total"] = lexical["titles_bodies"]
+    return {"pr_content_tokens": llm, "pr_content_tokens_lexical": lexical,
+            "prs_detailed_count": 0}
+
+
+def _addPrContentTokens(
+    prs: List[Dict[str, Any]],
+    detailsByNumber: Dict[Any, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Attach fetched provider content and count it once for both tokenizers."""
+    llm = _emptyPrTokenMetrics()
+    lexical = _emptyPrTokenMetrics()
+    detailedCount = 0
+
+    for pr in prs:
+        titleBody = "\n".join(filter(None, (pr.get("title"), pr.get("body"))))
+        pr["llm_token_count"] = getLlmTokens(titleBody)
+        pr["lexical_token_count"] = len(countLexicalTokens(titleBody))
+        llm["titles_bodies"] += pr["llm_token_count"]
+        lexical["titles_bodies"] += pr["lexical_token_count"]
+
+        details = detailsByNumber.get(pr.get("number"))
+        if not details:
+            continue
+
+        issueComments = details.get("comments", [])
+        reviewComments = details.get("review_comments", [])
+        commits = details.get("commit_messages", [])
+        pr["comment_details"] = issueComments
+        pr["review_comment_details"] = reviewComments
+        pr["review_details"] = details.get("reviews", [])
+        pr["file_details"] = details.get("files", [])
+        pr["commit_message_details"] = commits
+        pr["comments"] = len(issueComments)
+        pr["review_comments"] = len(reviewComments)
+        pr["commits"] = len(commits)
+        pr["additions"] = details.get("additions")
+        pr["deletions"] = details.get("deletions")
+        pr["changed_files"] = details.get("changed_files")
+
+        discussionText = "\n".join(
+            item.get("body", "") for item in issueComments + reviewComments if item.get("body")
+        )
+        commitText = "\n".join(item.get("message", "") for item in commits if item.get("message"))
+        discussionLlm = getLlmTokens(discussionText)
+        commitLlm = getLlmTokens(commitText)
+        discussionLexical = len(countLexicalTokens(discussionText))
+        commitLexical = len(countLexicalTokens(commitText))
+        pr["llm_token_count"] += discussionLlm + commitLlm
+        pr["lexical_token_count"] += discussionLexical + commitLexical
+        llm["discussion"] += discussionLlm
+        llm["commit_messages"] += commitLlm
+        lexical["discussion"] += discussionLexical
+        lexical["commit_messages"] += commitLexical
+        detailedCount += 1
+
+    llm["total"] = llm["titles_bodies"] + llm["discussion"] + llm["commit_messages"]
+    lexical["total"] = lexical["titles_bodies"] + lexical["discussion"] + lexical["commit_messages"]
+    return {"pr_content_tokens": llm, "pr_content_tokens_lexical": lexical,
+            "prs_detailed_count": detailedCount}
+
+
+def countUnifiedDiffChanges(diffText: str) -> Tuple[int, int]:
+    """Count added/removed content lines while excluding diff file headers."""
+    additions = 0
+    deletions = 0
+    for line in (diffText or "").splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    return additions, deletions
+
+
+def enrichGitLabPrContentTokens(
+    prs: List[Dict[str, Any]], domain: str, projectPath: str, token: Optional[str]
+) -> Dict[str, Any]:
+    """Fetch GitLab MR discussions and commit messages with bounded parallel I/O."""
+    import urllib.parse
+    headers = {"PRIVATE-TOKEN": token} if token else {}
+    encodedProject = urllib.parse.quote_plus(projectPath)
+
+    def fetchPaged(url: str) -> List[Dict[str, Any]]:
+        items = []
+        page = 1
+        while True:
+            response = callGitLabApi(url, headers, {"per_page": 100, "page": page})
+            if not response:
+                break
+            data = response.json()
+            if not isinstance(data, list):
+                break
+            items.extend(data)
+            nextPage = response.headers.get("X-Next-Page")
+            if not nextPage:
+                break
+            page = int(nextPage)
+        return items
+
+    def fetchOne(number: int) -> Tuple[int, Dict[str, Any]]:
+        base = f"https://{domain}/api/v4/projects/{encodedProject}/merge_requests/{number}"
+        discussions = fetchPaged(f"{base}/discussions")
+        commitsRaw = fetchPaged(f"{base}/commits")
+        additions = deletions = changedFiles = None
+        changesResponse = callGitLabApi(f"{base}/changes", headers)
+        if changesResponse:
+            changes = changesResponse.json().get("changes", [])
+            additions = deletions = 0
+            changedFiles = len(changes)
+            for change in changes:
+                added, removed = countUnifiedDiffChanges(change.get("diff") or "")
+                additions += added
+                deletions += removed
+        comments, reviewComments = [], []
+        seenNoteIds = set()
+        for discussion in discussions:
+            for note in discussion.get("notes", []):
+                noteId = note.get("id")
+                if noteId in seenNoteIds or note.get("system"):
+                    continue
+                seenNoteIds.add(noteId)
+                author = note.get("author") or {}
+                entry = {
+                    "id": noteId,
+                    "author": author.get("username"),
+                    "body": note.get("body") or "",
+                    "created_at": note.get("created_at"),
+                    "updated_at": note.get("updated_at"),
+                    "resolved": note.get("resolved"),
+                    "resolvable": note.get("resolvable"),
+                    "position": note.get("position"),
+                }
+                (reviewComments if note.get("position") else comments).append(entry)
+        commits = [{
+            "id": item.get("id"),
+            "short_id": item.get("short_id"),
+            "author": item.get("author_name"),
+            "message": item.get("message") or item.get("title") or "",
+            "created_at": item.get("created_at"),
+        } for item in commitsRaw]
+        fileDetails = [{
+            "filename": item.get("new_path"),
+            "previous_filename": item.get("old_path"),
+            "status": "renamed" if item.get("renamed_file") else
+                      "added" if item.get("new_file") else
+                      "deleted" if item.get("deleted_file") else "modified",
+            "patch": item.get("diff"),
+            "new_file": item.get("new_file"),
+            "deleted_file": item.get("deleted_file"),
+            "renamed_file": item.get("renamed_file"),
+        } for item in (changes if changesResponse else [])]
+        return number, {"comments": comments, "review_comments": reviewComments,
+                        "commit_messages": commits, "additions": additions,
+                        "deletions": deletions, "changed_files": changedFiles,
+                        "files": fileDetails}
+
+    details = {}
+    numbers = [pr.get("number") for pr in prs if pr.get("number") is not None]
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(numbers)))) as executor:
+        futures = {executor.submit(fetchOne, number): number for number in numbers}
+        for future in as_completed(futures):
+            number = futures[future]
+            try:
+                _, details[number] = future.result()
+            except Exception as exc:
+                logger.warning(f"[PR tokens] GitLab MR !{number} details skipped: {exc}")
+    return _addPrContentTokens(prs, details)
+
+
+def enrichBitbucketPrContentTokens(
+    prs: List[Dict[str, Any]], domain: str, workspace: str, repoName: str,
+    token: Optional[str], isCloud: bool, outputDir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fetch Bitbucket PR comments/review comments and commit messages."""
+    import urllib.parse
+    headers = _bitbucketAuthHeaders(token, isCloud)
+    encodedWorkspace = urllib.parse.quote(workspace, safe="")
+    encodedRepo = urllib.parse.quote(repoName, safe="")
+    prsByNumber = {pr.get("number"): pr for pr in prs if pr.get("number") is not None}
+
+    cacheDir = None
+    if outputDir:
+        cacheName = sanitizeFilename(f"{domain}_{workspace}_{repoName}")
+        cacheDir = os.path.join(outputDir, ".bitbucket_pr_checkpoint", cacheName)
+        os.makedirs(cacheDir, exist_ok=True)
+
+    def cachePath(number: int) -> Optional[str]:
+        return os.path.join(cacheDir, f"{number}.json") if cacheDir else None
+
+    def loadCachedDetails(number: int, updatedAt: Any) -> Optional[Dict[str, Any]]:
+        path = cachePath(number)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as cacheFile:
+                cached = json.load(cacheFile)
+            if (cached.get("schema_version") == 1
+                    and cached.get("updated_at") == updatedAt
+                    and isinstance(cached.get("details"), dict)):
+                return cached["details"]
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(f"[Bitbucket PR #{number}] Ignoring invalid checkpoint: {exc}")
+        return None
+
+    def saveCachedDetails(number: int, updatedAt: Any, details: Dict[str, Any]) -> None:
+        path = cachePath(number)
+        if not path:
+            return
+        tempPath = f"{path}.tmp"
+        try:
+            with open(tempPath, "w", encoding="utf-8") as cacheFile:
+                json.dump({
+                    "schema_version": 1,
+                    "updated_at": updatedAt,
+                    "details": details,
+                }, cacheFile, indent=2, ensure_ascii=False, default=str)
+            os.replace(tempPath, path)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(f"[Bitbucket PR #{number}] Could not save checkpoint: {exc}")
+
+    def fetchCloud(url: str) -> Tuple[List[Dict[str, Any]], bool]:
+        items = []
+        params = {"pagelen": 100}
+        while url:
+            response = callBitbucketApi(url, headers, params)
+            if not response:
+                return items, False
+            data = response.json()
+            if not isinstance(data, dict):
+                return items, False
+            items.extend(data.get("values", []))
+            url = data.get("next")
+            params = None
+        return items, True
+
+    def fetchServer(url: str) -> Tuple[List[Dict[str, Any]], bool]:
+        items, start = [], 0
+        while True:
+            response = callBitbucketApi(url, headers, {"limit": 100, "start": start})
+            if not response:
+                return items, False
+            data = response.json()
+            if not isinstance(data, dict):
+                return items, False
+            items.extend(data.get("values", []))
+            if data.get("isLastPage", True):
+                return items, True
+            start = data.get("nextPageStart", start + 100)
+        return items
+
+    def fetchOne(number: int) -> Tuple[int, Dict[str, Any]]:
+        providerPr = prsByNumber.get(number, {})
+        updatedAt = providerPr.get("updated_at")
+        cachedDetails = loadCachedDetails(number, updatedAt)
+        if cachedDetails is not None:
+            logger.info(
+                f"[Bitbucket PR #{number}] Successfully reused cached details."
+            )
+            return number, cachedDetails
+
+        if isCloud:
+            base = f"https://api.bitbucket.org/2.0/repositories/{encodedWorkspace}/{encodedRepo}/pullrequests/{number}"
+            commentsRaw, commentsOk = fetchCloud(f"{base}/comments")
+            commitsRaw, commitsOk = fetchCloud(f"{base}/commits")
+            diffstat, diffstatOk = fetchCloud(f"{base}/diffstat")
+            additions = sum(int(item.get("lines_added") or 0) for item in diffstat)
+            deletions = sum(int(item.get("lines_removed") or 0) for item in diffstat)
+            changedFiles = len(diffstat)
+            fileDetails = [{
+                "filename": ((item.get("new") or {}).get("path")),
+                "previous_filename": ((item.get("old") or {}).get("path")),
+                "status": item.get("status"),
+                "additions": item.get("lines_added"),
+                "deletions": item.get("lines_removed"),
+                "patch": None,
+            } for item in diffstat]
+            diffResponse = callBitbucketApi(f"{base}/diff", headers)
+            diffOk = bool(diffResponse)
+            if diffResponse:
+                fileDetails.append({"filename": None, "status": "aggregate_diff",
+                                    "patch": diffResponse.text})
+            comments, reviewComments = [], []
+            for item in commentsRaw:
+                content = item.get("content") or {}
+                user = item.get("user") or {}
+                entry = {
+                    "id": item.get("id"), "author": user.get("nickname") or user.get("display_name"),
+                    "body": content.get("raw") or "", "created_at": item.get("created_on"),
+                    "updated_at": item.get("updated_on"), "inline": item.get("inline"),
+                    "deleted": item.get("deleted", False),
+                }
+                (reviewComments if item.get("inline") else comments).append(entry)
+            commits = [{
+                "id": item.get("hash"),
+                "author": ((item.get("author") or {}).get("user") or {}).get("display_name"),
+                "message": item.get("message") or "", "created_at": item.get("date"),
+            } for item in commitsRaw]
+            reviews = [{
+                "author": (item.get("user") or {}).get("nickname") or
+                          (item.get("user") or {}).get("display_name"),
+                "state": "APPROVED" if item.get("approved") else
+                         ("CHANGES_REQUESTED" if item.get("state") == "changes_requested" else
+                          item.get("state")),
+                "approved": item.get("approved"),
+                "role": item.get("role"),
+            } for item in providerPr.get("participants", [])]
+        else:
+            base = f"https://{domain}/rest/api/1.0/projects/{encodedWorkspace}/repos/{encodedRepo}/pull-requests/{number}"
+            activities, activitiesOk = fetchServer(f"{base}/activities")
+            # Bitbucket Server returns comments inside the activities feed.
+            commentsOk = activitiesOk
+            commitsRaw, commitsOk = fetchServer(f"{base}/commits")
+            changesRaw, changesOk = fetchServer(f"{base}/changes")
+            changedFiles = len(changesRaw)
+            additions = deletions = None
+            diffResponse = callBitbucketApi(f"{base}/diff", headers)
+            diffOk = bool(diffResponse)
+            if diffResponse:
+                additions, deletions = countUnifiedDiffChanges(diffResponse.text)
+            fileDetails = [{
+                "filename": ((item.get("path") or {}).get("toString") or
+                             (item.get("path") or {}).get("name")),
+                "status": item.get("type"),
+                "patch": None,
+            } for item in changesRaw]
+            if diffResponse:
+                fileDetails.append({"filename": None, "status": "aggregate_diff",
+                                    "patch": diffResponse.text})
+            comments, reviewComments = [], []
+            for activity in activities:
+                comment = activity.get("comment")
+                if not comment:
+                    continue
+                author = comment.get("author") or {}
+                entry = {
+                    "id": comment.get("id"), "author": author.get("name") or author.get("displayName"),
+                    "body": comment.get("text") or "", "created_at": activity.get("createdDate"),
+                    "updated_at": comment.get("updatedDate"), "anchor": comment.get("anchor"),
+                    "resolved": comment.get("resolved"),
+                }
+                (reviewComments if comment.get("anchor") else comments).append(entry)
+            commits = [{
+                "id": item.get("id"),
+                "author": (item.get("author") or {}).get("name"),
+                "message": item.get("message") or "", "created_at": item.get("authorTimestamp"),
+            } for item in commitsRaw]
+            reviews = [{
+                "author": ((item.get("user") or {}).get("name") or
+                           (item.get("user") or {}).get("displayName")),
+                "state": item.get("status") or ("APPROVED" if item.get("approved") else None),
+                "approved": item.get("approved"),
+                "role": item.get("role"),
+            } for item in providerPr.get("reviewers", [])]
+        details = {"comments": comments, "review_comments": reviewComments,
+                   "commit_messages": commits, "additions": additions,
+                   "deletions": deletions, "changed_files": changedFiles,
+                   "files": fileDetails, "reviews": reviews}
+        complete = (commentsOk and commitsOk and diffOk
+                    and (diffstatOk if isCloud else changesOk and activitiesOk))
+        if complete:
+            saveCachedDetails(number, updatedAt, details)
+            logger.info(f"[Bitbucket PR #{number}] Details fetched successfully.")
+        else:
+            logger.warning(
+                f"[Bitbucket PR #{number}] Details were incomplete and were not checkpointed."
+            )
+        return number, details
+
+    details = {}
+    numbers = [pr.get("number") for pr in prs if pr.get("number") is not None]
+    try:
+        workerCount = max(1, min(3, int(os.getenv("BITBUCKET_PR_WORKERS", "1"))))
+    except (TypeError, ValueError):
+        workerCount = 1
+    with ThreadPoolExecutor(max_workers=min(workerCount, max(1, len(numbers)))) as executor:
+        futures = {executor.submit(fetchOne, number): number for number in numbers}
+        for future in as_completed(futures):
+            number = futures[future]
+            try:
+                _, details[number] = future.result()
+            except Exception as exc:
+                logger.warning(f"[PR tokens] Bitbucket PR #{number} details skipped: {exc}")
+    return _addPrContentTokens(prs, details)
+
+
+def enrichGitHubPrContentTokens(
+    g: Github, repo, prs: List[Dict[str, Any]], outputDir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Retain GitHub PR details and count the same content retained for GitLab."""
+    llm = _emptyPrTokenMetrics()
+    lexical = _emptyPrTokenMetrics()
+
+    for pr in prs:
+        text_value = "\n".join(filter(None, (pr.get("title"), pr.get("body"))))
+        pr["llm_token_count"] = getLlmTokens(text_value)
+        pr["lexical_token_count"] = len(countLexicalTokens(text_value))
+        llm["titles_bodies"] += pr["llm_token_count"]
+        lexical["titles_bodies"] += pr["lexical_token_count"]
+
+    def rawData(item: Any) -> Dict[str, Any]:
+        for attribute in ("_rawData", "_raw_data"):
+            try:
+                value = getattr(item, attribute, None)
+                if value:
+                    return dict(value)
+            except Exception:
+                pass
+        return {}
+
+    def objectValue(item: Any, attribute: str, default: Any = None) -> Any:
+        try:
+            value = getattr(item, attribute, default)
+            return default if value is None else value
+        except Exception:
+            return default
+
+    def isoValue(value: Any) -> Any:
+        return value.isoformat() if hasattr(value, "isoformat") else value
+
+    def fetch_details(number: int) -> Tuple[int, Dict[str, Any]]:
+        gh_pr = repo.get_pull(number)
+        issueComments = list(gh_pr.get_issue_comments())
+        reviewComments = list(gh_pr.get_review_comments())
+        reviews = list(gh_pr.get_reviews())
+        changedFiles = list(gh_pr.get_files())
+        prCommits = list(gh_pr.get_commits())
+        comments = []
+        for item in issueComments:
+            raw = rawData(item)
+            user = raw.get("user") or {}
+            itemUser = objectValue(item, "user")
+            comments.append({
+                **raw,
+                "id": raw.get("id", getattr(item, "id", None)),
+                "author": user.get("login") or objectValue(itemUser, "login"),
+                "body": raw.get("body") or getattr(item, "body", None) or "",
+                "created_at": raw.get("created_at") or isoValue(objectValue(item, "created_at")),
+                "updated_at": raw.get("updated_at") or isoValue(objectValue(item, "updated_at")),
+            })
+
+        reviewDetails = []
+        for item in reviewComments:
+            raw = rawData(item)
+            user = raw.get("user") or {}
+            itemUser = objectValue(item, "user")
+            reviewDetails.append({
+                **raw,
+                "id": raw.get("id", getattr(item, "id", None)),
+                "author": user.get("login") or objectValue(itemUser, "login"),
+                "body": raw.get("body") or getattr(item, "body", None) or "",
+                "created_at": raw.get("created_at") or isoValue(objectValue(item, "created_at")),
+                "updated_at": raw.get("updated_at") or isoValue(objectValue(item, "updated_at")),
+                "position": raw.get("position", objectValue(item, "position")),
+                "path": raw.get("path") or objectValue(item, "path"),
+                "commit_id": raw.get("commit_id") or objectValue(item, "commit_id"),
+            })
+
+        reviewSubmissions = []
+        for item in reviews:
+            raw = rawData(item)
+            user = raw.get("user") or {}
+            itemUser = objectValue(item, "user")
+            reviewSubmissions.append({
+                "id": raw.get("id", objectValue(item, "id")),
+                "author": user.get("login") or objectValue(itemUser, "login"),
+                "state": raw.get("state") or objectValue(item, "state"),
+                "body": raw.get("body") or objectValue(item, "body", ""),
+                "submitted_at": raw.get("submitted_at") or isoValue(objectValue(item, "submitted_at")),
+                "commit_id": raw.get("commit_id") or objectValue(item, "commit_id"),
+            })
+
+        fileDetails = []
+        for item in changedFiles:
+            raw = rawData(item)
+            fileDetails.append({
+                "filename": raw.get("filename") or objectValue(item, "filename"),
+                "previous_filename": raw.get("previous_filename") or objectValue(item, "previous_filename"),
+                "status": raw.get("status") or objectValue(item, "status"),
+                "additions": raw.get("additions", objectValue(item, "additions", 0)),
+                "deletions": raw.get("deletions", objectValue(item, "deletions", 0)),
+                "changes": raw.get("changes", objectValue(item, "changes", 0)),
+                # GitHub omits this for binary files and may truncate very large patches.
+                "patch": raw.get("patch") or objectValue(item, "patch"),
+                "sha": raw.get("sha") or objectValue(item, "sha"),
+            })
+
+        commits = []
+        for item in prCommits:
+            raw = rawData(item)
+            commit = raw.get("commit") or {}
+            authorInfo = commit.get("author") or {}
+            committerInfo = commit.get("committer") or {}
+            authorUser = raw.get("author") or {}
+            committerUser = raw.get("committer") or {}
+            sha = raw.get("sha") or getattr(item, "sha", None)
+            itemCommit = objectValue(item, "commit")
+            itemAuthorInfo = objectValue(itemCommit, "author")
+            itemCommitterInfo = objectValue(itemCommit, "committer")
+            itemAuthorUser = objectValue(item, "author")
+            commits.append({
+                "id": sha,
+                "short_id": sha[:8] if sha else None,
+                "author": authorUser.get("login") or objectValue(itemAuthorUser, "login")
+                          or authorInfo.get("name") or objectValue(itemAuthorInfo, "name"),
+                "message": commit.get("message") or objectValue(itemCommit, "message", ""),
+                "created_at": authorInfo.get("date") or isoValue(objectValue(itemAuthorInfo, "date"))
+                              or committerInfo.get("date") or isoValue(objectValue(itemCommitterInfo, "date")),
+            })
+
+        return number, {
+            "provider_metadata": rawData(gh_pr),
+            "comments": comments,
+            "review_comments": reviewDetails,
+            "reviews": reviewSubmissions,
+            "files": fileDetails,
+            "commit_messages": commits,
+            "additions": gh_pr.additions,
+            "deletions": gh_pr.deletions,
+            "changed_files": gh_pr.changed_files,
+        }
+
+    def exceptionHeaders(exc: Exception) -> Dict[str, Any]:
+        headers = getattr(exc, "headers", None) or {}
+        return {str(key).lower(): value for key, value in headers.items()}
+
+    def retryWaitSeconds(exc: Exception, attempt: int) -> float:
+        """Use GitHub's headers for primary/secondary limits, then back off safely."""
+        headers = exceptionHeaders(exc)
+        retryAfter = headers.get("retry-after")
+        if retryAfter is not None:
+            try:
+                return max(1.0, float(retryAfter)) + random.uniform(1.0, 3.0)
+            except (TypeError, ValueError):
+                pass
+
+        remaining = headers.get("x-ratelimit-remaining")
+        resetAt = headers.get("x-ratelimit-reset")
+        if str(remaining) == "0" and resetAt is not None:
+            try:
+                return max(1.0, float(resetAt) - time.time()) + 5.0
+            except (TypeError, ValueError):
+                pass
+
+        # GitHub recommends waiting at least a minute for a secondary limit.
+        return min(15 * 60, 60 * (2 ** attempt)) + random.uniform(1.0, 5.0)
+
+    def fetchDetailsWithRetry(number: int) -> Tuple[int, Dict[str, Any]]:
+        maxAttempts = 6
+        for attempt in range(maxAttempts):
+            try:
+                return fetch_details(number)
+            except Exception as exc:
+                status = getattr(exc, "status", None)
+                retryable = status in {403, 429, 500, 502, 503, 504}
+                if not retryable or attempt == maxAttempts - 1:
+                    raise
+                if status in {403, 429}:
+                    waitSeconds = retryWaitSeconds(exc, attempt)
+                else:
+                    waitSeconds = min(60, 2 ** (attempt + 1)) + random.uniform(0.0, 1.0)
+                logger.warning(
+                    f"[GitHub PR #{number}] HTTP {status}; retrying in {waitSeconds:.1f}s "
+                    f"({attempt + 1}/{maxAttempts - 1})..."
+                )
+                time.sleep(waitSeconds)
+
+    cacheDir = None
+    if outputDir:
+        repoName = sanitizeFilename(getattr(repo, "name", None) or "repository")
+        cacheDir = os.path.join(outputDir, ".github_pr_checkpoint", repoName)
+        os.makedirs(cacheDir, exist_ok=True)
+
+    def cachePath(number: int) -> Optional[str]:
+        return os.path.join(cacheDir, f"{number}.json") if cacheDir else None
+
+    def loadCachedDetails(number: int, updatedAt: Any) -> Optional[Dict[str, Any]]:
+        path = cachePath(number)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as cacheFile:
+                cached = json.load(cacheFile)
+            if cached.get("schema_version") == 2 and cached.get("updated_at") == updatedAt:
+                return cached.get("details")
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning(f"[GitHub PR #{number}] Ignoring invalid checkpoint: {exc}")
+        return None
+
+    def saveCachedDetails(number: int, updatedAt: Any, details: Dict[str, Any]):
+        path = cachePath(number)
+        if not path:
+            return
+        tempPath = f"{path}.tmp"
+        try:
+            with open(tempPath, "w", encoding="utf-8") as cacheFile:
+                json.dump({"schema_version": 2, "updated_at": updatedAt, "details": details}, cacheFile)
+            os.replace(tempPath, path)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(f"[GitHub PR #{number}] Could not save checkpoint: {exc}")
+
+    numbers = [pr.get("number") for pr in prs if pr.get("number") is not None]
+    prsByNumber = {pr.get("number"): pr for pr in prs if pr.get("number") is not None}
+    detailed_count = 0
+    failedNumbers = []
+    # GitHub recommends serial requests to avoid secondary rate limits. A large
+    # repository can require several API calls per PR, so parallel workers can
+    # trigger a 403 even when the primary hourly quota is still available.
+    for index, number in enumerate(numbers, 1):
+        try:
+            pr = prsByNumber.get(number)
+            updatedAt = (pr or {}).get("updated_at")
+            details = loadCachedDetails(number, updatedAt)
+            fromCheckpoint = details is not None
+            if details is None:
+                # Check periodically rather than spending another API request for
+                # every PR. The exception path still reacts immediately to limits.
+                if index == 1 or index % 25 == 0:
+                    handleRateLimit(g, minimum_remaining=100)
+                _, details = fetchDetailsWithRetry(number)
+                saveCachedDetails(number, updatedAt, details)
+            issueComments = details["comments"]
+            reviewComments = details["review_comments"]
+            commits = details["commit_messages"]
+            discussion_text = "\n".join(
+                item.get("body", "") for item in issueComments + reviewComments if item.get("body")
+            )
+            commit_text = "\n".join(item.get("message", "") for item in commits if item.get("message"))
+            discussionLlm = getLlmTokens(discussion_text)
+            commitLlm = getLlmTokens(commit_text)
+            discussionLexical = len(countLexicalTokens(discussion_text))
+            commitLexical = len(countLexicalTokens(commit_text))
+            llm["discussion"] += discussionLlm
+            llm["commit_messages"] += commitLlm
+            lexical["discussion"] += discussionLexical
+            lexical["commit_messages"] += commitLexical
+            if pr is not None:
+                providerMetadata = details["provider_metadata"]
+                for key, value in providerMetadata.items():
+                    pr.setdefault(key, value)
+                pr["author"] = providerMetadata.get("user") or pr.get("user")
+                pr["description"] = pr.get("body")
+                pr["web_url"] = pr.get("html_url")
+                pr["sha"] = pr.get("head_sha")
+                pr["reviewers"] = providerMetadata.get("requested_reviewers", [])
+                pr["work_in_progress"] = bool(providerMetadata.get("draft"))
+                pr["has_conflicts"] = providerMetadata.get("mergeable") is False
+                pr["merge_status"] = providerMetadata.get("mergeable_state")
+                pr["detailed_merge_status"] = providerMetadata.get("mergeable_state")
+                pr["reference"] = f"#{number}"
+                pr["comment_details"] = issueComments
+                pr["review_comment_details"] = reviewComments
+                pr["review_details"] = details.get("reviews", [])
+                pr["file_details"] = details.get("files", [])
+                pr["commit_message_details"] = commits
+                pr["llm_token_count"] += discussionLlm + commitLlm
+                pr["lexical_token_count"] += discussionLexical + commitLexical
+                pr["additions"] = details["additions"]
+                pr["deletions"] = details["deletions"]
+                pr["changed_files"] = details["changed_files"]
+                pr["comments"] = len(issueComments)
+                pr["review_comments"] = len(reviewComments)
+                pr["commits"] = len(commits)
+            detailed_count += 1
+            if index % 25 == 0:
+                logger.info(f"Enriched {index}/{len(numbers)} GitHub PRs...")
+            if not fromCheckpoint:
+                # A small jitter prevents a predictable burst pattern and greatly
+                # reduces the chance of GitHub's secondary rate limit firing.
+                time.sleep(random.uniform(1.0, 2.0))
+        except Exception as exc:
+            failedNumbers.append(number)
+            logger.warning(f"[PR tokens] GitHub PR #{number} details skipped: {exc}")
+
+    llm["total"] = llm["titles_bodies"] + llm["discussion"] + llm["commit_messages"]
+    lexical["total"] = lexical["titles_bodies"] + lexical["discussion"] + lexical["commit_messages"]
+    return {
+        "pr_content_tokens": llm,
+        "pr_content_tokens_lexical": lexical,
+        "prs_detailed_count": detailed_count,
+        "pr_analysis_complete": detailed_count == len(numbers),
+        "pr_detail_failures": failedNumbers,
     }
 
 
@@ -2707,18 +4536,169 @@ def sanitizeFilename(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", name)
 
 
+def getPrLifecycleStatus(pr: Dict[str, Any]) -> str:
+    """Return one mutually-exclusive, provider-neutral PR lifecycle state."""
+    explicit = str(pr.get("lifecycle_status") or "").lower()
+    if explicit in {"open", "merged", "closed"}:
+        return explicit
+
+    provider_state = str(pr.get("provider_state") or pr.get("state") or "").lower()
+    if pr.get("merged_at") is not None or provider_state == "merged":
+        return "merged"
+    if provider_state in {"open", "opened"}:
+        return "open"
+    return "closed"
+
+
+GITLAB_PR_JSON_FIELDS = (
+    "id", "iid", "project_id", "title", "description", "state", "created_at",
+    "updated_at", "merged_by", "merge_user", "merged_at", "closed_by", "closed_at",
+    "target_branch", "source_branch", "user_notes_count", "upvotes", "downvotes",
+    "author", "assignees", "assignee", "reviewers", "source_project_id",
+    "target_project_id", "labels", "draft", "work_in_progress", "milestone",
+    "merge_when_pipeline_succeeds", "merge_status", "detailed_merge_status",
+    "merge_after", "sha", "merge_commit_sha", "squash_commit_sha",
+    "discussion_locked", "should_remove_source_branch", "force_remove_source_branch",
+    "prepared_at", "reference", "references", "url", "html_url", "time_stats", "squash",
+    "squash_on_merge", "task_completion_status", "has_conflicts",
+    "blocking_discussions_resolved", "approvals_before_merge", "imported",
+    "imported_from", "provider", "provider_state", "lifecycle_status", "number",
+    "body", "user", "html_url", "additions", "deletions", "changed_files",
+    "comments", "review_comments", "commits", "head_sha", "comment_details",
+    "review_comment_details", "review_details", "file_details",
+    "commit_message_details", "llm_token_count",
+    "lexical_token_count",
+)
+
+GITLAB_ONLY_PR_FIELDS = {
+    "iid", "upvotes", "downvotes", "merge_when_pipeline_succeeds", "merge_after",
+    "squash_commit_sha", "should_remove_source_branch", "force_remove_source_branch",
+    "prepared_at", "time_stats", "squash", "squash_on_merge", "task_completion_status",
+    "blocking_discussions_resolved", "approvals_before_merge", "imported", "imported_from",
+}
+
+
+def normalizeGithubPrToGitLabSchema(pr: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only GitLab-schema fields, populated with GitHub equivalents where available."""
+    number = pr.get("number")
+    base = pr.get("base") or {}
+    head = pr.get("head") or {}
+    baseRepo = base.get("repo") or {}
+    headRepo = head.get("repo") or {}
+    fullName = baseRepo.get("full_name")
+    reference = pr.get("reference") or (f"#{number}" if number is not None else None)
+    references = pr.get("references") or {
+        "short": reference,
+        "relative": reference,
+        "full": f"{fullName}#{number}" if fullName and number is not None else reference,
+    }
+
+    comments = [{
+        "id": item.get("id"),
+        "author": item.get("author"),
+        "body": item.get("body") or "",
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "resolved": item.get("resolved"),
+        "resolvable": item.get("resolvable"),
+        "position": item.get("position"),
+    } for item in pr.get("comment_details", [])]
+
+    reviewComments = [{
+        "id": item.get("id"),
+        "author": item.get("author"),
+        "body": item.get("body") or "",
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "resolved": item.get("resolved"),
+        "resolvable": item.get("resolvable"),
+        "position": item.get("position"),
+    } for item in pr.get("review_comment_details", [])]
+
+    reviews = [{
+        "id": item.get("id"),
+        "author": item.get("author"),
+        "state": item.get("state"),
+        "body": item.get("body") or "",
+        "submitted_at": item.get("submitted_at"),
+        "commit_id": item.get("commit_id"),
+    } for item in pr.get("review_details", [])]
+
+    commits = [{
+        "id": item.get("id"),
+        "short_id": item.get("short_id"),
+        "author": item.get("author"),
+        "message": item.get("message") or "",
+        "created_at": item.get("created_at"),
+    } for item in pr.get("commit_message_details", [])]
+
+    mapped = dict(pr)
+    mapped.update({
+        "iid": number,
+        "project_id": pr.get("project_id") or baseRepo.get("id"),
+        "description": pr.get("body"),
+        "author": pr.get("author") or pr.get("user"),
+        "reviewers": pr.get("reviewers") or pr.get("requested_reviewers", []),
+        "source_project_id": pr.get("source_project_id") or headRepo.get("id"),
+        "target_project_id": pr.get("target_project_id") or baseRepo.get("id"),
+        "user_notes_count": int(pr.get("comments") or 0) + int(pr.get("review_comments") or 0),
+        "work_in_progress": bool(pr.get("draft")),
+        "merge_user": pr.get("merge_user") or pr.get("merged_by"),
+        "merge_status": pr.get("merge_status") or pr.get("mergeable_state"),
+        "detailed_merge_status": pr.get("detailed_merge_status") or pr.get("mergeable_state"),
+        "sha": pr.get("sha") or pr.get("head_sha"),
+        "discussion_locked": pr.get("discussion_locked", pr.get("locked")),
+        "reference": reference,
+        "references": references,
+        "url": pr.get("url") or pr.get("web_url") or pr.get("html_url"),
+        "html_url": pr.get("html_url") or pr.get("web_url") or pr.get("url"),
+        "has_conflicts": pr.get("has_conflicts", pr.get("mergeable") is False),
+        "provider": "github",
+        "comment_details": comments,
+        "review_comment_details": reviewComments,
+        "review_details": reviews,
+        "file_details": pr.get("file_details", []),
+        "commit_message_details": commits,
+    })
+    return {
+        field: mapped.get(field)
+        for field in GITLAB_PR_JSON_FIELDS
+        if field not in GITLAB_ONLY_PR_FIELDS
+    }
+
+
+def removeUnwantedUrlFields(value: Any) -> Any:
+    """Recursively retain only exact `url` and `html_url` URL fields."""
+    if isinstance(value, list):
+        return [removeUnwantedUrlFields(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    cleaned = {}
+    for key, item in value.items():
+        if "url" in key.lower() and key not in {"url", "html_url"}:
+            continue
+        cleaned[key] = removeUnwantedUrlFields(item)
+    return cleaned
+
+
 def dumpPrJsonFiles(outputDir: str, sanitizedRepoName: str, prs: List[Dict[str, Any]]):
     """
     Dump all, open, closed, and merged PR lists into JSON files in outputDir.
     """
     os.makedirs(outputDir, exist_ok=True)
 
-    open_prs = [pr for pr in prs if pr.get("state") == "open"]
-    closed_prs = [pr for pr in prs if pr.get("state") == "closed"]
-    merged_prs = [pr for pr in prs if pr.get("state") == "closed" and pr.get("merged_at") is not None]
+    outputPrs = []
+    for pr in prs:
+        outputPr = normalizeGithubPrToGitLabSchema(pr) if pr.get("provider") == "github" else dict(pr)
+        outputPr["url"] = outputPr.get("url") or outputPr.get("web_url") or outputPr.get("html_url")
+        outputPr["html_url"] = outputPr.get("html_url") or outputPr.get("web_url") or outputPr.get("url")
+        outputPrs.append(removeUnwantedUrlFields(outputPr))
+    open_prs = [pr for pr in outputPrs if getPrLifecycleStatus(pr) == "open"]
+    closed_prs = [pr for pr in outputPrs if getPrLifecycleStatus(pr) == "closed"]
+    merged_prs = [pr for pr in outputPrs if getPrLifecycleStatus(pr) == "merged"]
 
     files_to_write = {
-        f"all_prs_{sanitizedRepoName}.json": prs,
+        f"all_prs_{sanitizedRepoName}.json": outputPrs,
         f"open_prs_{sanitizedRepoName}.json": open_prs,
         f"closed_prs_{sanitizedRepoName}.json": closed_prs,
         f"merged_prs_{sanitizedRepoName}.json": merged_prs,
@@ -2732,6 +4712,576 @@ def dumpPrJsonFiles(outputDir: str, sanitizedRepoName: str, prs: List[Dict[str, 
             logger.info(f"Saved PR JSON dump: {filepath}")
         except Exception as e:
             logger.error(f"Failed to save PR JSON dump {filepath}: {e}")
+
+
+def addGrandTokenCountsToPrJsonFiles(
+    outputDir: str, llmPrs: int, lexicalPrs: int,
+):
+    """Write one file-level token summary aligned with the summary CSV values."""
+    if not os.path.isdir(outputDir):
+        return
+
+    for filename in os.listdir(outputDir):
+        if not filename.endswith(".json") or "_prs_" not in filename:
+            continue
+        filepath = os.path.join(outputDir, filename)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            prs = payload.get("pull_requests", []) if isinstance(payload, dict) else payload
+            if not isinstance(prs, list):
+                continue
+            if not prs:
+                with open(filepath, "w", encoding="utf-8"):
+                    pass
+                continue
+            for pr in prs:
+                pr.pop("llm_repository_token_count", None)
+                pr.pop("llm_all_prs_token_count", None)
+                pr.pop("llm_grand_token_count", None)
+                pr.pop("lexical_repository_token_count", None)
+                pr.pop("lexical_all_prs_token_count", None)
+                pr.pop("lexical_grand_token_count", None)
+            payload = {
+                "pull_requests": prs,
+                "token_summary": {
+                    "llm_all_prs_token_count": llmPrs,
+                    "lexical_all_prs_token_count": lexicalPrs,
+                },
+            }
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to add grand token counts to {filepath}: {e}")
+
+def dumpCommitsCsv(outputDir: str, sanitizedRepoName: str, commits: List[Dict[str, Any]]):
+    os.makedirs(outputDir, exist_ok=True)
+    filepath = os.path.join(outputDir, f"commits_{sanitizedRepoName}.csv")
+    display_headers = ["hash", "author", "email", "date", "message", "Meaningful"]
+    try:
+        with CSV_LOCK:
+            with open(filepath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=display_headers)
+                writer.writeheader()
+                for row in commits:
+                    writer.writerow({
+                        "hash": row.get("hash", ""),
+                        "author": row.get("author", ""),
+                        "email": row.get("email", ""),
+                        "date": row.get("date", ""),
+                        "message": row.get("message", ""),
+                        "Meaningful": row.get("meaningful", ""),
+                    })
+        logger.info(f"Saved commit-level CSV: {filepath}")
+    except Exception as e:
+        logger.error(f"Failed to save commits CSV {filepath}: {e}")   
+
+
+def dumpJson(filepath: str, payload: Any) -> None:
+    """Atomically write a JSON extraction artifact."""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    tempPath = f"{filepath}.tmp"
+    with open(tempPath, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, default=str)
+    os.replace(tempPath, filepath)
+
+
+ANALYSIS_CHECKPOINT_VERSION = 1
+
+
+class AnalysisCheckpoint:
+    """Persist completed pipeline stages so interrupted runs can resume safely."""
+
+    def __init__(self, outputDir: str, signature: str):
+        self.path = os.path.join(outputDir, ".analysis_checkpoint.json")
+        self.signature = signature
+        self.data: Dict[str, Any] = {
+            "version": ANALYSIS_CHECKPOINT_VERSION,
+            "signature": signature,
+            "completed": {},
+        }
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            if (saved.get("version") == ANALYSIS_CHECKPOINT_VERSION
+                    and saved.get("signature") == signature
+                    and isinstance(saved.get("completed"), dict)):
+                self.data = saved
+            else:
+                logger.info("[resume] Ignoring checkpoint because the repository or options changed.")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            logger.warning(f"[resume] Ignoring unreadable checkpoint: {exc}")
+
+    def get(self, stage: str) -> Optional[Dict[str, Any]]:
+        saved = self.data["completed"].get(stage)
+        if isinstance(saved, dict) and "value" in saved:
+            if stage != "completed_analysis":
+                print(f"[Resume] Reusing completed {stage} stage...")
+            return saved
+        return None
+
+    def save(self, stage: str, value: Any, seconds: float) -> None:
+        self.data["completed"][stage] = {
+            "value": value,
+            "seconds": round(seconds, 2),
+            "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        try:
+            dumpJson(self.path, self.data)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning(f"[resume] Could not save checkpoint: {exc}")
+
+    def markComplete(self, report: Dict[str, Any], reportFile: str,
+                     targetDir: str, seconds: float) -> None:
+        """Keep only the final result so later runs can skip this repository."""
+        self.data["completed"] = {}
+        self.save("completed_analysis", {
+            "report": report,
+            "report_file": reportFile,
+            "target_dir": targetDir,
+        }, seconds)
+
+    def clear(self) -> None:
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(f"[resume] Could not remove completed checkpoint: {exc}")
+
+
+def analysisCheckpointSignature(args: argparse.Namespace, targetDir: str) -> str:
+    """Build a stable identity for inputs that affect reusable stage results."""
+    gitHead = runGit(["rev-parse", "HEAD"], targetDir) or ""
+    gitChanges = runGit(["status", "--porcelain"], targetDir) or ""
+    options = {
+        "target": os.path.normcase(os.path.abspath(targetDir)),
+        "input": safe_url(str(args.input)),
+        "branch": getattr(args, "branch", None),
+        "mode": args.mode,
+        "max_files": args.max_files,
+        "git_head": gitHead,
+        "git_changes": gitChanges,
+        "provenance": provenanceOptions(args),
+    }
+    encoded = json.dumps(options, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def runCheckpointedStage(
+    checkpoint: AnalysisCheckpoint, stage: str, work: Any
+) -> Tuple[Any, float]:
+    saved = checkpoint.get(stage)
+    if saved is not None:
+        return saved["value"], float(saved.get("seconds", 0.0))
+
+    started = time.time()
+    value = work()
+    elapsed = time.time() - started
+    checkpoint.save(stage, value, elapsed)
+    return value, elapsed
+
+
+def extractLocalHistoryAndAutomation(repoDir: str, outputDir: str, repoName: str,
+                                     commits: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Export fetched Git refs plus test/CI definitions and retained reports."""
+    branchesRaw = runGit(["for-each-ref", "--format=%(refname:short)%09%(objectname)",
+                          "refs/heads", "refs/remotes"], repoDir, timeout=300) or ""
+    tagsRaw = runGit(["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(creatordate:iso-strict)",
+                      "refs/tags"], repoDir, timeout=300) or ""
+    branches = []
+    for line in branchesRaw.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and not parts[0].endswith("/HEAD"):
+            branches.append({"name": parts[0], "sha": parts[1]})
+    tags = []
+    for line in tagsRaw.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) >= 2:
+            tags.append({"name": parts[0], "sha": parts[1],
+                         "created_at": parts[2] if len(parts) > 2 else None})
+
+    safeName = sanitizeFilename(repoName)
+    shallow = os.path.isfile(os.path.join(repoDir, ".git", "shallow"))
+    history = {
+        "scope": "all_fetched_refs",
+        "complete_claimed": False,
+        "limitations": (["shallow_clone"] if shallow else []) +
+                       ["Deleted/unfetched/unreachable history cannot be recovered from the clone."],
+        "shallow_clone": shallow,
+        "commits": commits,
+        "branches": branches,
+        "tags": tags,
+    }
+    dumpJson(os.path.join(outputDir, f"git_history_{safeName}.json"), history)
+
+    ciNames = {"Jenkinsfile", ".gitlab-ci.yml", ".gitlab-ci.yaml", ".travis.yml",
+               "azure-pipelines.yml", "azure-pipelines.yaml", "bitbucket-pipelines.yml",
+               "circle.yml", "appveyor.yml", "buildkite.yml"}
+    reportNames = {value.lower() for value in COVERAGE_FILES} | {
+        "junit.xml", "test-results.xml", "pytest.xml", "test-report.xml",
+        "coverage.json", "clover.xml", "jacoco.xml", "surefire-reports",
+    }
+    testPatterns = re.compile(r"(^|[/\\])(tests?|specs?|__tests__)([/\\]|$)|"
+                              r"(^|[/\\]).*(test|spec)\.[^.]+$", re.IGNORECASE)
+    ciFiles, testFiles, retainedReports = [], [], []
+    for root, dirs, files in os.walk(repoDir):
+        dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "vendor", ".venv", "venv"}]
+        for filename in files:
+            path = os.path.join(root, filename)
+            relative = os.path.relpath(path, repoDir).replace("\\", "/")
+            lower = relative.lower()
+            if (filename in ciNames or lower.startswith(".github/workflows/") or
+                    lower.startswith(".circleci/") or lower.startswith(".azure-pipelines/")):
+                ciFiles.append(relative)
+            if testPatterns.search(relative):
+                testFiles.append(relative)
+            if filename.lower() in reportNames or any(lower.endswith("/" + name) for name in reportNames):
+                retainedReports.append(relative)
+
+    reportSummaries = []
+    for relative in sorted(set(retainedReports)):
+        path = os.path.join(repoDir, relative.replace("/", os.sep))
+        summary: Dict[str, Any] = {"path": relative}
+        try:
+            summary["size_bytes"] = os.path.getsize(path)
+            lowerName = relative.lower()
+            if lowerName.endswith(".xml"):
+                import xml.etree.ElementTree as ET
+                root = ET.parse(path).getroot()
+                summary.update({
+                    key.replace("-", "_"): root.attrib.get(key)
+                    for key in ("tests", "failures", "errors", "skipped",
+                                "time", "line-rate", "branch-rate")
+                    if key in root.attrib
+                })
+            elif lowerName.endswith("lcov.info"):
+                totals = {"lines_found": 0, "lines_hit": 0,
+                          "branches_found": 0, "branches_hit": 0}
+                prefixes = {"LF:": "lines_found", "LH:": "lines_hit",
+                            "BRF:": "branches_found", "BRH:": "branches_hit"}
+                with open(path, "r", encoding="utf-8", errors="replace") as reportFile:
+                    for line in reportFile:
+                        for prefix, key in prefixes.items():
+                            if line.startswith(prefix):
+                                totals[key] += int(line[len(prefix):].strip() or 0)
+                summary.update(totals)
+        except Exception as exc:
+            summary["parse_error"] = str(exc)
+        reportSummaries.append(summary)
+
+    automation = {
+        "test_files": sorted(set(testFiles)),
+        "ci_configuration_files": sorted(set(ciFiles)),
+        "retained_test_or_coverage_reports": sorted(set(retainedReports)),
+        "retained_test_report_summaries": reportSummaries,
+        "test_execution_performed": False,
+        "ci_results_source": "provider_api_when_available",
+    }
+    dumpJson(os.path.join(outputDir, f"tests_ci_inventory_{safeName}.json"), automation)
+    return {"git_history": history, "tests_ci_inventory": automation}
+
+
+def calculatePrCommentMetrics(prs: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Return general and review-comment totals split by PR lifecycle."""
+    metrics = {
+        "total_pr_comments_count": 0,
+        "open_pr_comments_count": 0,
+        "closed_pr_comments_count": 0,
+        "merged_pr_comments_count": 0,
+        "total_pr_review_comment_count": 0,
+        "open_pr_review_comment_count": 0,
+        "closed_pr_review_comment_count": 0,
+        "merged_pr_review_comment_count": 0,
+    }
+    for pr in prs:
+        status = getPrLifecycleStatus(pr)
+        comments = int(pr.get("comments") or 0)
+        reviewComments = int(pr.get("review_comments") or 0)
+        metrics["total_pr_comments_count"] += comments
+        metrics["total_pr_review_comment_count"] += reviewComments
+        if status in {"open", "closed", "merged"}:
+            metrics[f"{status}_pr_comments_count"] += comments
+            metrics[f"{status}_pr_review_comment_count"] += reviewComments
+    return metrics
+
+
+def extractGitHubIssuesAndCi(repo: Any, outputDir: str, repoName: str) -> Dict[str, Any]:
+    """Extract issue collaboration history and retained Actions/check metadata."""
+    safeName = sanitizeFilename(repoName)
+    issues = []
+    issueErrors = []
+    try:
+        for issue in repo.get_issues(state="all"):
+            raw = dict(getattr(issue, "_raw_data", {}) or {})
+            if raw.get("pull_request") or getattr(issue, "pull_request", None):
+                continue
+            comments = []
+            try:
+                for comment in issue.get_comments():
+                    cRaw = dict(getattr(comment, "_raw_data", {}) or {})
+                    comments.append({
+                        "id": cRaw.get("id", getattr(comment, "id", None)),
+                        "author": (cRaw.get("user") or {}).get("login"),
+                        "body": cRaw.get("body", getattr(comment, "body", "")),
+                        "created_at": cRaw.get("created_at"),
+                        "updated_at": cRaw.get("updated_at"),
+                    })
+            except Exception as exc:
+                issueErrors.append({"issue": issue.number, "section": "comments", "error": str(exc)})
+            issues.append({
+                "number": issue.number, "title": issue.title, "body": issue.body,
+                "state": issue.state, "state_reason": raw.get("state_reason"),
+                "author": (raw.get("user") or {}).get("login"),
+                "assignees": [item.get("login") for item in raw.get("assignees", [])],
+                "labels": [item.get("name") for item in raw.get("labels", [])],
+                "milestone": (raw.get("milestone") or {}).get("title"),
+                "created_at": raw.get("created_at"), "updated_at": raw.get("updated_at"),
+                "closed_at": raw.get("closed_at"), "comments": comments,
+            })
+    except Exception as exc:
+        issueErrors.append({"section": "issues", "error": str(exc)})
+    dumpJson(os.path.join(outputDir, f"issues_{safeName}.json"), {
+        "complete_claimed": False, "issues": issues, "errors": issueErrors,
+    })
+
+    runs, ciErrors = [], []
+    try:
+        for run in repo.get_workflow_runs():
+            raw = dict(getattr(run, "_raw_data", {}) or {})
+            jobs = []
+            try:
+                for job in run.jobs():
+                    jRaw = dict(getattr(job, "_raw_data", {}) or {})
+                    jobs.append({
+                        "id": jRaw.get("id"), "name": jRaw.get("name"),
+                        "status": jRaw.get("status"), "conclusion": jRaw.get("conclusion"),
+                        "started_at": jRaw.get("started_at"), "completed_at": jRaw.get("completed_at"),
+                        "steps": jRaw.get("steps", []),
+                    })
+            except Exception as exc:
+                ciErrors.append({"run": raw.get("id"), "section": "jobs", "error": str(exc)})
+            runs.append({
+                "id": raw.get("id"), "name": raw.get("name"), "event": raw.get("event"),
+                "status": raw.get("status"), "conclusion": raw.get("conclusion"),
+                "workflow_id": raw.get("workflow_id"), "run_number": raw.get("run_number"),
+                "head_branch": raw.get("head_branch"), "head_sha": raw.get("head_sha"),
+                "created_at": raw.get("created_at"), "updated_at": raw.get("updated_at"),
+                "run_started_at": raw.get("run_started_at"), "jobs": jobs,
+            })
+    except Exception as exc:
+        ciErrors.append({"section": "workflow_runs", "error": str(exc)})
+    dumpJson(os.path.join(outputDir, f"ci_results_{safeName}.json"), {
+        "complete_claimed": False,
+        "limitations": ["Expired logs/artifacts and inaccessible historical runs cannot be recovered."],
+        "workflow_runs": runs, "errors": ciErrors,
+    })
+    return {"issues_extracted": len(issues), "ci_runs_extracted": len(runs),
+            "issues_errors": len(issueErrors), "ci_errors": len(ciErrors)}
+
+
+def extractGitLabIssuesAndCi(domain: str, projectPath: str, token: Optional[str],
+                             outputDir: str, repoName: str) -> Dict[str, Any]:
+    """Extract GitLab issues, notes, pipelines and jobs when accessible."""
+    import urllib.parse
+    headers = {"PRIVATE-TOKEN": token} if token else {}
+    encoded = urllib.parse.quote_plus(projectPath)
+    base = f"https://{domain}/api/v4/projects/{encoded}"
+
+    def fetchPaged(url: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        result, page = [], 1
+        while True:
+            query = dict(params or {})
+            query.update({"per_page": 100, "page": page})
+            response = callGitLabApi(url, headers, query)
+            if not response:
+                break
+            data = response.json()
+            if not isinstance(data, list):
+                break
+            result.extend(data)
+            nextPage = response.headers.get("X-Next-Page")
+            if not nextPage:
+                break
+            page = int(nextPage)
+        return result
+
+    errors, issues = [], []
+    try:
+        for issue in fetchPaged(f"{base}/issues", {"scope": "all", "state": "all"}):
+            iid = issue.get("iid")
+            notes = fetchPaged(f"{base}/issues/{iid}/notes") if iid is not None else []
+            issues.append({
+                "iid": iid, "title": issue.get("title"), "description": issue.get("description"),
+                "state": issue.get("state"), "author": (issue.get("author") or {}).get("username"),
+                "assignees": [item.get("username") for item in issue.get("assignees", [])],
+                "labels": issue.get("labels", []), "milestone": issue.get("milestone"),
+                "created_at": issue.get("created_at"), "updated_at": issue.get("updated_at"),
+                "closed_at": issue.get("closed_at"),
+                "comments": [{
+                    "id": note.get("id"), "author": (note.get("author") or {}).get("username"),
+                    "body": note.get("body"), "created_at": note.get("created_at"),
+                    "updated_at": note.get("updated_at"), "system": note.get("system"),
+                } for note in notes],
+            })
+    except Exception as exc:
+        errors.append({"section": "issues", "error": str(exc)})
+    dumpJson(os.path.join(outputDir, f"issues_{sanitizeFilename(repoName)}.json"), {
+        "complete_claimed": False, "issues": issues, "errors": errors,
+    })
+
+    pipelines = []
+    try:
+        for pipeline in fetchPaged(f"{base}/pipelines"):
+            pipelineId = pipeline.get("id")
+            jobs = fetchPaged(f"{base}/pipelines/{pipelineId}/jobs") if pipelineId else []
+            pipelines.append({**pipeline, "jobs": jobs})
+    except Exception as exc:
+        errors.append({"section": "pipelines", "error": str(exc)})
+    dumpJson(os.path.join(outputDir, f"ci_results_{sanitizeFilename(repoName)}.json"), {
+        "complete_claimed": False,
+        "limitations": ["Expired artifacts/logs and inaccessible runs cannot be recovered."],
+        "pipelines": pipelines, "errors": errors,
+    })
+    return {"issues_extracted": len(issues), "ci_runs_extracted": len(pipelines),
+            "supplemental_errors": len(errors)}
+
+
+def extractBitbucketIssuesAndCi(domain: str, workspace: str, repoName: str,
+                                token: Optional[str], isCloud: bool,
+                                prs: List[Dict[str, Any]], outputDir: str) -> Dict[str, Any]:
+    """Extract Bitbucket Cloud issues/pipelines or Server build statuses."""
+    import urllib.parse
+    headers = _bitbucketAuthHeaders(token, isCloud)
+    encodedWorkspace = urllib.parse.quote(workspace, safe="")
+    encodedRepo = urllib.parse.quote(repoName, safe="")
+    safeName = sanitizeFilename(repoName)
+    errors: List[Dict[str, Any]] = []
+
+    def fetchCloud(url: str, params: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], bool]:
+        result, first = [], True
+        while url:
+            response = callBitbucketApi(url, headers, params if first else None)
+            first = False
+            if not response:
+                return result, False
+            data = response.json()
+            result.extend(data.get("values", []))
+            url = data.get("next")
+        return result, True
+
+    def fetchServer(url: str) -> Tuple[List[Dict[str, Any]], bool]:
+        result, start = [], 0
+        while True:
+            response = callBitbucketApi(url, headers, {"limit": 100, "start": start})
+            if not response:
+                return result, False
+            data = response.json()
+            result.extend(data.get("values", []))
+            if data.get("isLastPage", True):
+                return result, True
+            start = data.get("nextPageStart", start + 100)
+
+    issues: List[Dict[str, Any]] = []
+    issueAvailable = False
+    if isCloud:
+        base = f"https://api.bitbucket.org/2.0/repositories/{encodedWorkspace}/{encodedRepo}"
+        rawIssues, issueAvailable = fetchCloud(f"{base}/issues", {"pagelen": 100})
+        for issue in rawIssues:
+            issueId = issue.get("id")
+            comments, commentsOk = fetchCloud(f"{base}/issues/{issueId}/comments", {"pagelen": 100})
+            if not commentsOk:
+                errors.append({"issue": issueId, "section": "comments",
+                               "error": "Unavailable or permission denied"})
+            issues.append({
+                "id": issueId, "title": issue.get("title"),
+                "content": (issue.get("content") or {}).get("raw"),
+                "state": issue.get("state"), "kind": issue.get("kind"),
+                "priority": issue.get("priority"), "component": issue.get("component"),
+                "milestone": issue.get("milestone"), "version": issue.get("version"),
+                "reporter": (issue.get("reporter") or {}).get("display_name"),
+                "assignee": (issue.get("assignee") or {}).get("display_name"),
+                "created_at": issue.get("created_on"), "updated_at": issue.get("updated_on"),
+                "comments": [{
+                    "id": item.get("id"),
+                    "author": (item.get("user") or {}).get("display_name"),
+                    "body": (item.get("content") or {}).get("raw"),
+                    "created_at": item.get("created_on"), "updated_at": item.get("updated_on"),
+                    "deleted": item.get("deleted", False),
+                } for item in comments],
+            })
+        if not issueAvailable:
+            errors.append({"section": "issues", "error":
+                           "Issue tracker unavailable, disabled, or permission denied"})
+    else:
+        errors.append({"section": "issues", "error":
+                       "Bitbucket Server/Data Center has no native repository issues API; issues may live in Jira"})
+
+    dumpJson(os.path.join(outputDir, f"issues_{safeName}.json"), {
+        "provider": "bitbucket_cloud" if isCloud else "bitbucket_server",
+        "available": issueAvailable, "complete_claimed": False,
+        "issues": issues, "errors": [e for e in errors if e.get("section") in {"issues", "comments"}],
+    })
+
+    ciRuns: List[Dict[str, Any]] = []
+    statuses: List[Dict[str, Any]] = []
+    ciAvailable = False
+    if isCloud:
+        pipelines, ciAvailable = fetchCloud(f"{base}/pipelines/", {"pagelen": 50, "sort": "-created_on"})
+        for pipeline in pipelines:
+            pipelineUuid = pipeline.get("uuid")
+            encodedUuid = urllib.parse.quote(str(pipelineUuid), safe="{}")
+            steps, stepsOk = fetchCloud(f"{base}/pipelines/{encodedUuid}/steps/", {"pagelen": 100})
+            if not stepsOk:
+                errors.append({"pipeline": pipelineUuid, "section": "steps",
+                               "error": "Unavailable or permission denied"})
+            ciRuns.append({
+                "uuid": pipelineUuid, "build_number": pipeline.get("build_number"),
+                "state": pipeline.get("state"), "trigger": pipeline.get("trigger"),
+                "target": pipeline.get("target"), "created_at": pipeline.get("created_on"),
+                "completed_at": pipeline.get("completed_on"), "duration": pipeline.get("duration_in_seconds"),
+                "steps": [{
+                    "uuid": step.get("uuid"), "name": step.get("name"),
+                    "state": step.get("state"), "started_at": step.get("started_on"),
+                    "completed_at": step.get("completed_on"),
+                    "duration": step.get("duration_in_seconds"),
+                } for step in steps],
+            })
+        if not ciAvailable:
+            errors.append({"section": "pipelines", "error":
+                           "Pipelines unavailable, disabled, or permission denied"})
+    else:
+        statusBase = f"https://{domain}/rest/build-status/1.0/commits"
+        seenShas = set()
+        for pr in prs:
+            sha = pr.get("head_sha") or pr.get("merge_commit_sha")
+            if not sha or sha in seenShas:
+                continue
+            seenShas.add(sha)
+            rawStatuses, ok = fetchServer(f"{statusBase}/{urllib.parse.quote(str(sha), safe='')}")
+            ciAvailable = ciAvailable or ok
+            if not ok:
+                errors.append({"commit": sha, "section": "build_statuses",
+                               "error": "Unavailable or permission denied"})
+                continue
+            for item in rawStatuses:
+                statuses.append({
+                    "commit": sha, "key": item.get("key"), "name": item.get("name"),
+                    "state": item.get("state"), "description": item.get("description"),
+                    "created_at": item.get("dateAdded"), "updated_at": item.get("lastUpdated"),
+                })
+
+    dumpJson(os.path.join(outputDir, f"ci_results_{safeName}.json"), {
+        "provider": "bitbucket_cloud" if isCloud else "bitbucket_server",
+        "available": ciAvailable, "complete_claimed": False,
+        "limitations": ["Expired logs/artifacts and inaccessible historical results cannot be recovered."],
+        "pipeline_runs": ciRuns, "commit_build_statuses": statuses,
+        "errors": [e for e in errors if e.get("section") not in {"issues", "comments"}],
+    })
+    return {"issues_extracted": len(issues), "ci_runs_extracted": len(ciRuns),
+            "build_statuses_extracted": len(statuses), "supplemental_errors": len(errors)}
 
 
 def runGitHubPrAnalysis(
@@ -2748,7 +5298,17 @@ def runGitHubPrAnalysis(
         "open_pr_count": 0,
         "closed_pr_count": 0,
         "merged_pr_count": 0,
+        "total_pr_comments_count": 0,
+        "open_pr_comments_count": 0,
+        "closed_pr_comments_count": 0,
+        "merged_pr_comments_count": 0,
+        "total_pr_review_comment_count": 0,
+        "open_pr_review_comment_count": 0,
+        "closed_pr_review_comment_count": 0,
+        "merged_pr_review_comment_count": 0,
         "github_pr_analysis_available": False,
+        "pr_content_tokens": _emptyPrTokenMetrics(),
+        "pr_content_tokens_lexical": _emptyPrTokenMetrics(),
     }
 
     env_token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
@@ -2776,14 +5336,25 @@ def runGitHubPrAnalysis(
         try:
             from github import Auth
             auth = Auth.Token(final_token)
-            g = Github(auth=auth)
+            # Centralize rate-limit handling below. PyGithub's default retry
+            # layer can otherwise sleep internally before our checkpoint/retry
+            # logic gets a chance to inspect GitHub's response headers.
+            g = Github(auth=auth, retry=None)
         except (ImportError, AttributeError):
-            g = Github(final_token)
+            g = Github(final_token, retry=None)
         repo = g.get_repo(f"{owner}/{repo_name}")
 
         prs = fetchPullRequests(g, repo)
 
         metrics = calculatePrMetrics(prs)
+        metrics["_merge_commit_identities"] = buildMergeCommitIdentities(prs)
+
+        token_metrics = enrichGitHubPrContentTokens(g, repo, prs, outputDir)
+        metrics.update(token_metrics)
+        metrics.update(calculatePrCommentMetrics(prs))
+
+        supplemental = extractGitHubIssuesAndCi(repo, outputDir, repo_name)
+        metrics.update(supplemental)
 
         sanitized_name = sanitizeFilename(repo_name)
         dumpPrJsonFiles(outputDir, sanitized_name, prs)
@@ -2802,19 +5373,23 @@ def enrichViaGithubApi(
     """
     Optional GitHub API enrichment (requires PyGithub + valid token for private repos).
     Fetches: open/closed status, stars, forks, topics, description, visibility,
-    subscriber count, default branch, and whether repo was ever public.
+    subscriber count and default branch. Historical visibility is checked by provenance.py.
     """
     if not HAS_PYGITHUB:
         return {"available": False, "reason": "PyGithub not installed"}
     if not token:
         return {"available": False, "reason": "No GitHub token provided"}
-    m = re.search(r"github\.com[/:]([^/]+)/([^/\.]+)", repoUrl)
-    if not m:
+    name = github_name(repoUrl)
+    if not name:
         return {"available": False, "reason": "Cannot parse GitHub URL"}
 
     try:
-        g = Github(token)
-        repo = g.get_repo(f"{m.group(1)}/{m.group(2)}")
+        try:
+            from github import Auth
+            g = Github(auth=Auth.Token(token), retry=None)
+        except (ImportError, AttributeError):
+            g = Github(token, retry=None)
+        repo = g.get_repo(name)
 
 
         return {
@@ -2841,6 +5416,23 @@ def enrichViaGithubApi(
         return {"available": False, "reason": str(exc)}
 
 
+def repositoryDisplayName(target: str) -> str:
+    """Return the repository's original basename for user-facing paths and files."""
+    clean = str(target or "").strip().strip('"').rstrip("/\\")
+    if not clean:
+        return "repository"
+
+    if clean.startswith(("https://", "http://", "ssh://", "git@")):
+        clean = clean.split("?", 1)[0].split("#", 1)[0]
+        name = re.split(r"[/\\:]", clean)[-1]
+    else:
+        name = os.path.basename(os.path.abspath(clean))
+
+    if name.lower().endswith(".git"):
+        name = name[:-4]
+    return name or "repository"
+
+
 def saveReport(
     reportData: Dict[str, Any],
     repoPath: str,
@@ -2852,13 +5444,10 @@ def saveReport(
     Save analysis report to JSON and generate two separate summary CSVs.
     """
     absRepo = os.path.abspath(repoPath)
-    repoName = os.path.basename(absRepo)
-
-    if isUrl:
-        safeName = inputTarget.rstrip("/").split("/")[-1].replace(".git", "")
-        outDir = os.path.join(outputRootDir, safeName)
-    else:
-        outDir = os.path.join(outputRootDir, repoName)
+    # Keep the original repository name in metadata and user-facing paths.
+    repoName = str(reportData.get("repo") or os.path.basename(absRepo))
+    repositoryKey = str(reportData.get("repository_key") or repoName)
+    outDir = os.path.join(outputRootDir, _safeOutputName(repoName))
 
     os.makedirs(outDir, exist_ok=True)
     outFile = os.path.join(outDir, f"{repoName}_report.json")
@@ -2867,6 +5456,7 @@ def saveReport(
     tm = reportData.get("tool_metrics", {})
     he = reportData.get("heuristics", {})
     gh = reportData.get("github_api", {})
+    provenanceRow = provenance_columns(reportData.get("provenance", {}))
 
     primaryLangs = gt.get("languages", {}).get("core_list", [])
     primaryLangs = list(dict.fromkeys([LANG_MERGE_MAP.get(lang, lang) for lang in primaryLangs]))
@@ -2956,18 +5546,36 @@ def saveReport(
         "open_pr_count": 0,
         "closed_pr_count": 0,
         "merged_pr_count": 0,
+        "total_pr_comments_count": 0,
+        "open_pr_comments_count": 0,
+        "closed_pr_comments_count": 0,
+        "merged_pr_comments_count": 0,
+        "total_pr_review_comment_count": 0,
+        "open_pr_review_comment_count": 0,
+        "closed_pr_review_comment_count": 0,
+        "merged_pr_review_comment_count": 0,
         "github_pr_analysis_available": False,
     })
+    pr_velocity_profile = prs_data.get("pr_velocity_profile", "N/A")
+    blacklist_status = prs_data.get("blacklist_status", "N/A")
+    prLlmTokens = prs_data.get("pr_content_tokens", _emptyPrTokenMetrics())
+    prLexicalTokens = prs_data.get("pr_content_tokens_lexical", _emptyPrTokenMetrics())
+    tokenMetrics = tm.get("tokens", {})
 
     all_headers = [
         "repo_name", "is_git", "license_type",
         "first_commit_date", "last_commit_date",
-        "loc_code", "loc_comment", "loc_blank", "loc_files",
+        "authored_loc", "non_authored_loc", "loc_comment", "loc_blank", "loc_files",
         "lang_count", "languages", "languages_frontend", "languages_backend",
         "commits", "contributors", "all_contributors_count",
-        "all_contributors", "branch_count", "meaningful_commit_count",
+        "all_contributors", "branch_count", "default_branch", "analysis_branch",
+        "branch_selection_source", "meaningful_commit_count",
         "development_span_months", "commits_per_month", "git_history_intact",
-        "tokens_llm", "lexical_token", "duplication_weighted_percent",
+        "tokens_llm_code", "tokens_llm_docs", "tokens_llm_config",
+        "tokens_llm_repository", "tokens_llm_pr", "tokens_llm_grand_total",
+        "lexical_token_code", "lexical_token_docs", "lexical_token_config",
+        "lexical_token_repository", "lexical_token_pr", "lexical_token_grand_total",
+        "duplication_weighted_percent",
         "code_complexity", "ai_detection_percent", "frameworks",
         "framework_frontend", "framework_backend",
         "databases_used", "third_party_apis", "setup_guidelines",
@@ -2976,7 +5584,13 @@ def saveReport(
         "languages_percentage_bytes(>5%)", "frameworks_percentage_bytes(>5%)",
         "total_time_seconds",
         "total_pr_count", "open_pr_count", "closed_pr_count",
-        "merged_pr_count", "github_pr_analysis_available"
+        "merged_pr_count",
+        "total_pr_comments_count", "open_pr_comments_count",
+        "closed_pr_comments_count", "merged_pr_comments_count",
+        "total_pr_review_comment_count", "open_pr_review_comment_count",
+        "closed_pr_review_comment_count", "merged_pr_review_comment_count",
+        "github_pr_analysis_available",
+        "pr_velocity_profile", "blacklist_status"
     ]
 
     all_row = {
@@ -2985,7 +5599,8 @@ def saveReport(
         "license_type":       tm.get("compliance", {}).get("license_type", "N/A"),
         "first_commit_date":  gt.get("git", {}).get("first_commit", "N/A"),
         "last_commit_date":   gt.get("git", {}).get("last_update", "N/A"),
-        "loc_code":           gt.get("loc", {}).get("breakdown", {}).get("code", 0),
+        "authored_loc":       gt.get("loc", {}).get("breakdown", {}).get("authored", 0),
+        "non_authored_loc":   gt.get("loc", {}).get("breakdown", {}).get("non_authored", 0),
         "loc_comment":        gt.get("loc", {}).get("breakdown", {}).get("comment", 0),
         "loc_blank":          gt.get("loc", {}).get("breakdown", {}).get("blank", 0),
         "loc_files":          gt.get("loc", {}).get("breakdown", {}).get("nFiles", 0),
@@ -2998,12 +5613,25 @@ def saveReport(
         "all_contributors_count": gt.get("git", {}).get("all_contributors_count", 0),
         "all_contributors":   ", ".join([c.get("name", "") for c in gt.get("git", {}).get("all_contributors", [])]),
         "branch_count":       gt.get("git", {}).get("branch_count", 0),
+        "default_branch":     gt.get("git", {}).get("default_branch", ""),
+        "analysis_branch":    gt.get("git", {}).get("analysis_branch", ""),
+        "branch_selection_source": gt.get("git", {}).get("branch_selection_source", ""),
         "meaningful_commit_count": gt.get("git", {}).get("meaningful_commit_count", 0),
         "development_span_months": gt.get("git", {}).get("active_span_months", 0),
         "commits_per_month":  f"{freq} commits/mo",
         "git_history_intact": gt.get("git", {}).get("history_integrity", {}).get("appears_intact", False),
-        "tokens_llm":         tm.get("tokens", {}).get("llm", 0),
-        "lexical_token":      lexTokCount,
+        "tokens_llm_code":    tokenMetrics.get("llm_code", 0),
+        "tokens_llm_docs":    tokenMetrics.get("llm_docs", 0),
+        "tokens_llm_config":  tokenMetrics.get("llm_config", 0),
+        "tokens_llm_repository": tokenMetrics.get("llm_repository", tokenMetrics.get("llm", 0)),
+        "tokens_llm_pr":      prLlmTokens.get("total", 0),
+        "tokens_llm_grand_total": tokenMetrics.get("llm", 0),
+        "lexical_token_code": tokenMetrics.get("lexical_code", 0),
+        "lexical_token_docs": tokenMetrics.get("lexical_docs", 0),
+        "lexical_token_config": tokenMetrics.get("lexical_config", 0),
+        "lexical_token_repository": tokenMetrics.get("lexical_repository", lexTokCount),
+        "lexical_token_pr":   prLexicalTokens.get("total", 0),
+        "lexical_token_grand_total": tokenMetrics.get("lexical", 0),
         "duplication_weighted_percent":   f"{tm.get('duplication', {}).get('token_weighted', 0)*100:.1f}%",
         "code_complexity":    he.get("complexity", "Low"),
         "ai_detection_percent": f"{he.get('ai_detection', {}).get('repo_score', 0)*100:.1f}%",
@@ -3024,19 +5652,38 @@ def saveReport(
         "open_pr_count":      prs_data.get("open_pr_count", 0),
         "closed_pr_count":     prs_data.get("closed_pr_count", 0),
         "merged_pr_count":     prs_data.get("merged_pr_count", 0),
+        "total_pr_comments_count": prs_data.get("total_pr_comments_count", 0),
+        "open_pr_comments_count": prs_data.get("open_pr_comments_count", 0),
+        "closed_pr_comments_count": prs_data.get("closed_pr_comments_count", 0),
+        "merged_pr_comments_count": prs_data.get("merged_pr_comments_count", 0),
+        "total_pr_review_comment_count": prs_data.get("total_pr_review_comment_count", 0),
+        "open_pr_review_comment_count": prs_data.get("open_pr_review_comment_count", 0),
+        "closed_pr_review_comment_count": prs_data.get("closed_pr_review_comment_count", 0),
+        "merged_pr_review_comment_count": prs_data.get("merged_pr_review_comment_count", 0),
         "github_pr_analysis_available": prs_data.get("github_pr_analysis_available", False),
     }
 
     meta_headers = [
-        "repo_name", "lexical_token", "framework_frontend", "framework_backend",
+        "repo_name", "tokens_llm_code", "tokens_llm_docs", "tokens_llm_config",
+        "tokens_llm_repository", "tokens_llm_pr", "tokens_llm_grand_total",
+        "lexical_token_code", "lexical_token_docs", "lexical_token_config",
+        "lexical_token_repository", "lexical_token_pr", "lexical_token_grand_total",
+        "framework_frontend", "framework_backend",
         "languages_frontend", "languages_backend",
         "language_framework_details", "domain_industry",
         "commercial_usage_summary", "security_scrubbing_confirmation",
-        "full_git_history", "repo_rating_score", "first_commit_date", "last_commit_date",
+        "full_git_history", "default_branch", "analysis_branch", "branch_selection_source",
+        "repo_rating_score", "first_commit_date", "last_commit_date",
         "languages_percentage_bytes(>5%)", "frameworks_percentage_bytes(>5%)",
         "development_span_months", "commits_per_month", "unique_contributors",
         "all_contributors_count", "all_contributors",
-        "total_pr_count", "open_pr_count", "closed_pr_count", "merged_pr_count", "github_pr_analysis_available"
+        "total_pr_count", "open_pr_count", "closed_pr_count", "merged_pr_count",
+        "total_pr_comments_count", "open_pr_comments_count",
+        "closed_pr_comments_count", "merged_pr_comments_count",
+        "total_pr_review_comment_count", "open_pr_review_comment_count",
+        "closed_pr_review_comment_count", "merged_pr_review_comment_count",
+        "github_pr_analysis_available",
+        "pr_velocity_profile", "blacklist_status"
     ]
 
     license_type_str = tm.get("compliance", {}).get("license_type", "Unknown") or "Unknown"
@@ -3045,7 +5692,18 @@ def saveReport(
 
     meta_row = {
         "repo_name":                  reportData.get("repo"),
-        "lexical_token":              lexTokCount,
+        "tokens_llm_code":            tokenMetrics.get("llm_code", 0),
+        "tokens_llm_docs":            tokenMetrics.get("llm_docs", 0),
+        "tokens_llm_config":          tokenMetrics.get("llm_config", 0),
+        "tokens_llm_repository":      tokenMetrics.get("llm_repository", tokenMetrics.get("llm", 0)),
+        "tokens_llm_pr":              prLlmTokens.get("total", 0),
+        "tokens_llm_grand_total":     tokenMetrics.get("llm", 0),
+        "lexical_token_code":         tokenMetrics.get("lexical_code", 0),
+        "lexical_token_docs":         tokenMetrics.get("lexical_docs", 0),
+        "lexical_token_config":       tokenMetrics.get("lexical_config", 0),
+        "lexical_token_repository":   tokenMetrics.get("lexical_repository", lexTokCount),
+        "lexical_token_pr":           prLexicalTokens.get("total", 0),
+        "lexical_token_grand_total":  tokenMetrics.get("lexical", 0),
         "framework_frontend":         "|".join(frontendFws),
         "framework_backend":          "|".join(backendFws),
         "languages_frontend":         "|".join(frontendLangs),
@@ -3055,6 +5713,9 @@ def saveReport(
         "commercial_usage_summary":   commercial_summary,
         "security_scrubbing_confirmation": sec_status,
         "full_git_history":           all_row["git_history_intact"],
+        "default_branch":             all_row["default_branch"],
+        "analysis_branch":            all_row["analysis_branch"],
+        "branch_selection_source":    all_row["branch_selection_source"],
         "repo_rating_score":          all_row["repo_rating_score"],
         "first_commit_date":          all_row["first_commit_date"],
         "last_commit_date":           all_row["last_commit_date"],
@@ -3069,8 +5730,24 @@ def saveReport(
         "open_pr_count":              prs_data.get("open_pr_count", 0),
         "closed_pr_count":             prs_data.get("closed_pr_count", 0),
         "merged_pr_count":             prs_data.get("merged_pr_count", 0),
+        "total_pr_comments_count":     prs_data.get("total_pr_comments_count", 0),
+        "open_pr_comments_count":      prs_data.get("open_pr_comments_count", 0),
+        "closed_pr_comments_count":    prs_data.get("closed_pr_comments_count", 0),
+        "merged_pr_comments_count":    prs_data.get("merged_pr_comments_count", 0),
+        "total_pr_review_comment_count": prs_data.get("total_pr_review_comment_count", 0),
+        "open_pr_review_comment_count": prs_data.get("open_pr_review_comment_count", 0),
+        "closed_pr_review_comment_count": prs_data.get("closed_pr_review_comment_count", 0),
+        "merged_pr_review_comment_count": prs_data.get("merged_pr_review_comment_count", 0),
         "github_pr_analysis_available": prs_data.get("github_pr_analysis_available", False),
+        "pr_velocity_profile":        pr_velocity_profile,
+        "blacklist_status":           blacklist_status,
     }
+
+    for headers, row in ((all_headers, all_row), (meta_headers, meta_row)):
+        headers.append("repository_key")
+        row["repository_key"] = repositoryKey
+        headers.extend(provenanceRow)
+        row.update(provenanceRow)
 
     reportData["full_report_snapshot"] = {
         **all_row,  # Include everything currently in all_row
@@ -3081,22 +5758,46 @@ def saveReport(
         "watchers":           gh.get("subscribers", "N/A"),
         "open_issues":        gh.get("open_issues", "N/A"),
         "creation_date":      gh.get("created_at", "N/A"),
-        "loc_verified":       gt.get("loc", {}).get("value", 0),
+        "authored_loc_verified": gt.get("loc", {}).get("breakdown", {}).get("authored", 0),
+        "non_authored_loc":   gt.get("loc", {}).get("breakdown", {}).get("non_authored", 0),
         "tokenizer_method":   tm.get("tokens", {}).get("tokenizer", "N/A"),
+        "pr_content_tokens_breakdown": prLlmTokens,
     }
+
+    addGrandTokenCountsToPrJsonFiles(
+        outDir,
+        prLlmTokens.get("total", 0),
+        prLexicalTokens.get("total", 0),
+    )
 
     with open(outFile, "w", encoding="utf-8") as f:
         json.dump(reportData, f, indent=2)
 
     def appendToCsv(filename, headers, row_data):
         path = os.path.join(outputRootDir, filename)
-        exists = os.path.isfile(path)
+        repoKey = "repo_name" if "repo_name" in headers else "Repository Name"
         with CSV_LOCK:
-            with open(path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=headers)
-                if not exists:
-                    writer.writeheader()
+            existingRows = []
+            if os.path.isfile(path):
+                with open(path, "r", newline="", encoding="utf-8") as f:
+                    latestByRepo = {}
+                    for row in csv.DictReader(f):
+                        latestByRepo[row.get("repository_key") or row.get(repoKey)] = row
+                    existingRows = [
+                        row for repoName, row in latestByRepo.items()
+                        if repoName != (row_data.get("repository_key") or row_data.get(repoKey))
+                    ]
+                    for existing in existingRows:
+                        for field in ("ever_public", "public_to_private_transition"):
+                            if field in headers and not existing.get(field):
+                                existing[field] = "UNKNOWN"
+            tempPath = path + ".tmp"
+            with open(tempPath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(existingRows)
                 writer.writerow(row_data)
+            os.replace(tempPath, path)
 
     pass
 
@@ -3111,7 +5812,8 @@ def saveReport(
         "First Commit Date",
         "Last Commit Date",
         "Development Span (Months)",
-        "Lines of Code (Code)",
+        "Authored LOC",
+        "Non-Authored LOC",
         "Lines of Code (Comments)",
         "Lines of Code (Blank)",
         "Total Files",
@@ -3122,13 +5824,36 @@ def saveReport(
         "open_pr_count",
         "closed_pr_count",
         "merged_pr_count",
+        "total_pr_comments_count",
+        "open_pr_comments_count",
+        "closed_pr_comments_count",
+        "merged_pr_comments_count",
+        "total_pr_review_comment_count",
+        "open_pr_review_comment_count",
+        "closed_pr_review_comment_count",
+        "merged_pr_review_comment_count",
         "github_pr_analysis_available",
+        "pr_velocity_profile",
+        "blacklist_status",
         "Number of Contributors with commits",
         "Total Contributors (All-Time)",
         "Contributor List",
         "Branch Count",
-        "LLM Tokens",
-        "Lexical Tokens",
+        "Default Branch",
+        "Analysis Branch",
+        "Branch Selection Source",
+        "LLM Tokens (Code)",
+        "LLM Tokens (Docs)",
+        "LLM Tokens (Config)",
+        "LLM Tokens (Repository)",
+        "LLM Tokens (PR/MR Content)",
+        "LLM Tokens (Grand Total)",
+        "Lexical Tokens (Code)",
+        "Lexical Tokens (Docs)",
+        "Lexical Tokens (Config)",
+        "Lexical Tokens (Repository)",
+        "Lexical Tokens (PR/MR Content)",
+        "Lexical Tokens (Grand Total)",
         "Code Duplication (Weighted %)",
         "Code Complexity",
         "AI Detection Percentage",
@@ -3146,7 +5871,10 @@ def saveReport(
         "Setup Guidelines",
         "Security Findings",
         "Documentation Quality",
-        "Repository Rating Score"
+        "Repository Rating Score",
+        "Repository Rating Label",
+        "Acceptance Decision",
+        "Rejection Reason"
     ]
 
     legacy_row = {
@@ -3157,7 +5885,8 @@ def saveReport(
         "First Commit Date": all_row.get("first_commit_date", ""),
         "Last Commit Date": all_row.get("last_commit_date", ""),
         "Development Span (Months)": all_row.get("development_span_months", ""),
-        "Lines of Code (Code)": all_row.get("loc_code", ""),
+        "Authored LOC": all_row.get("authored_loc", ""),
+        "Non-Authored LOC": all_row.get("non_authored_loc", ""),
         "Lines of Code (Comments)": all_row.get("loc_comment", ""),
         "Lines of Code (Blank)": all_row.get("loc_blank", ""),
         "Total Files": all_row.get("loc_files", ""),
@@ -3168,13 +5897,34 @@ def saveReport(
         "open_pr_count": all_row.get("open_pr_count", ""),
         "closed_pr_count": all_row.get("closed_pr_count", ""),
         "merged_pr_count": all_row.get("merged_pr_count", ""),
+        "total_pr_comments_count": all_row.get("total_pr_comments_count", ""),
+        "open_pr_comments_count": all_row.get("open_pr_comments_count", ""),
+        "closed_pr_comments_count": all_row.get("closed_pr_comments_count", ""),
+        "merged_pr_comments_count": all_row.get("merged_pr_comments_count", ""),
+        "total_pr_review_comment_count": all_row.get("total_pr_review_comment_count", ""),
+        "open_pr_review_comment_count": all_row.get("open_pr_review_comment_count", ""),
+        "closed_pr_review_comment_count": all_row.get("closed_pr_review_comment_count", ""),
+        "merged_pr_review_comment_count": all_row.get("merged_pr_review_comment_count", ""),
         "github_pr_analysis_available": all_row.get("github_pr_analysis_available", ""),
         "Number of Contributors with commits": all_row.get("contributors", ""),
         "Total Contributors (All-Time)": all_row.get("all_contributors_count", ""),
         "Contributor List": all_row.get("all_contributors", ""),
         "Branch Count": all_row.get("branch_count", ""),
-        "LLM Tokens": all_row.get("tokens_llm", ""),
-        "Lexical Tokens": all_row.get("lexical_token", ""),
+        "Default Branch": all_row.get("default_branch", ""),
+        "Analysis Branch": all_row.get("analysis_branch", ""),
+        "Branch Selection Source": all_row.get("branch_selection_source", ""),
+        "LLM Tokens (Code)": all_row.get("tokens_llm_code", ""),
+        "LLM Tokens (Docs)": all_row.get("tokens_llm_docs", ""),
+        "LLM Tokens (Config)": all_row.get("tokens_llm_config", ""),
+        "LLM Tokens (Repository)": all_row.get("tokens_llm_repository", ""),
+        "LLM Tokens (PR/MR Content)": all_row.get("tokens_llm_pr", ""),
+        "LLM Tokens (Grand Total)": all_row.get("tokens_llm_grand_total", ""),
+        "Lexical Tokens (Code)": all_row.get("lexical_token_code", ""),
+        "Lexical Tokens (Docs)": all_row.get("lexical_token_docs", ""),
+        "Lexical Tokens (Config)": all_row.get("lexical_token_config", ""),
+        "Lexical Tokens (Repository)": all_row.get("lexical_token_repository", ""),
+        "Lexical Tokens (PR/MR Content)": all_row.get("lexical_token_pr", ""),
+        "Lexical Tokens (Grand Total)": all_row.get("lexical_token_grand_total", ""),
         "Code Duplication (Weighted %)": all_row.get("duplication_weighted_percent", ""),
         "Code Complexity": all_row.get("code_complexity", ""),
         "AI Detection Percentage": all_row.get("ai_detection_percent", ""),
@@ -3192,8 +5942,65 @@ def saveReport(
         "Setup Guidelines": all_row.get("setup_guidelines", ""),
         "Security Findings": all_row.get("security_findings", ""),
         "Documentation Quality": all_row.get("documentation_quality", ""),
-        "Repository Rating Score": all_row.get("repo_rating_score", "")
+        "Repository Rating Score": all_row.get("repo_rating_score", ""),
+        "Repository Rating Label": all_row.get("repo_rating_label", "N/A"),
+        # Project-mode values are finalized after every repository belonging to
+        # the project has been evaluated. Single/batch analysis retains N/A.
+        "Acceptance Decision": "N/A",
+        "Rejection Reason": ""
     }
+
+    legacy_headers.extend(provenanceRow)
+    legacy_headers.append("repository_key")
+    legacy_row["repository_key"] = repositoryKey
+    legacy_row.update(provenanceRow)
+    legacy_row["pr_velocity_profile"] = pr_velocity_profile
+    legacy_row["blacklist_status"] = blacklist_status
+    legacyPath = os.path.join(outputRootDir, "legacy.csv")
+    if os.path.isfile(legacyPath):
+        # Transparently migrate legacy.csv files created by older versions so
+        # appended rows always align with the expanded header.
+        with CSV_LOCK:
+            with open(legacyPath, "r", encoding="utf-8-sig", newline="") as f:
+                existingReader = csv.DictReader(f)
+                existingRows = list(existingReader)
+                retiredLegacyHeaders = {
+                    "Lines of Code (Code)", "total_pr_comments", "total_review_comments",
+                    "personal_security_log_status",
+                }
+                existingHeaders = [
+                    header for header in (existingReader.fieldnames or [])
+                    if header not in retiredLegacyHeaders
+                ]
+                for existing in existingRows:
+                    for field in ("ever_public", "public_to_private_transition"):
+                        if not existing.get(field):
+                            existing[field] = "UNKNOWN"
+            if existingHeaders:
+                # Preserve any user-defined legacy columns and append only the
+                # fields introduced by this version.
+                mergedLegacyHeaders = existingHeaders + [
+                    header for header in legacy_headers if header not in existingHeaders
+                ]
+                # Keep repository PR/MR comment totals immediately to the right
+                # of merged_pr_count, including when migrating an older CSV.
+                commentHeaders = [
+                    "total_pr_comments_count", "open_pr_comments_count",
+                    "closed_pr_comments_count", "merged_pr_comments_count",
+                    "total_pr_review_comment_count", "open_pr_review_comment_count",
+                    "closed_pr_review_comment_count", "merged_pr_review_comment_count",
+                ]
+                for header in commentHeaders:
+                    if header in mergedLegacyHeaders:
+                        mergedLegacyHeaders.remove(header)
+                mergedIndex = mergedLegacyHeaders.index("merged_pr_count") + 1
+                mergedLegacyHeaders[mergedIndex:mergedIndex] = commentHeaders
+                legacy_headers = mergedLegacyHeaders
+            if existingHeaders and existingHeaders != legacy_headers:
+                with open(legacyPath, "w", encoding="utf-8-sig", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=legacy_headers, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(existingRows)
 
     appendToCsv("legacy.csv", legacy_headers, legacy_row)
 
@@ -3280,48 +6087,99 @@ def runInteractiveMode() -> Optional[argparse.Namespace]:
             input=inputTarget,
             output_dir=outDir,
             clone_dir=None,
+            branch=None,
             mode=mode,
             max_files=maxFiles
         )
 
 
-def runAnalysis(args: argparse.Namespace) -> bool:
+def runAnalysis(args: argparse.Namespace) -> Any:
     """
     Execute complete analysis pipeline (Stages 0–5).
     """
     inputTarget = args.input
+    if not getattr(args, "audit_preflight_complete", False):
+        preflightGithubAuditAccess(args, [inputTarget])
+    requestedBranch = (getattr(args, "branch", None) or "").strip() or None
     githubToken = getattr(args, "github_token", None)
     if not githubToken:
         githubToken = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
     gitlabToken = getattr(args, "gitlab_token", None)
     if not gitlabToken:
         gitlabToken = os.getenv("GITLAB_TOKEN") or os.getenv("GL_TOKEN")
+    bitbucketToken = getattr(args, "bitbucket_token", None)
+    if not bitbucketToken:
+        bitbucketToken = os.getenv("BITBUCKET_TOKEN") or os.getenv("BB_TOKEN")
+    
     startTime = time.time()
 
     isUrl = (
-        inputTarget.startswith("http://")
+        inputTarget.startswith("ssh://")
+        or inputTarget.startswith("http://")
         or inputTarget.startswith("https://")
         or inputTarget.startswith("git@")
     )
     targetDir = inputTarget
+    branchContext: Dict[str, str] = {}
+    sourceType = "local_repository"
+    resumingWithoutOrigin = False
 
     try:
         if isUrl:
             cloneBase = args.clone_dir if args.clone_dir else os.path.join(os.getcwd(), "cloned_repos")
             os.makedirs(cloneBase, exist_ok=True)
 
-            repoName = os.path.basename(inputTarget.rstrip("/").replace(".git", ""))
+            repoName = repositoryDisplayName(inputTarget)
             targetDir = os.path.join(cloneBase, repoName)
 
             if os.path.exists(targetDir):
+                sourceType = "existing_clone"
+                existingOrigin = runGit(["config", "--get", "remote.origin.url"], targetDir)
+                checkpointPath = os.path.join(
+                    args.output_dir, _safeOutputName(repoName),
+                    ".analysis_checkpoint.json",
+                )
+                resumingWithoutOrigin = bool(
+                    not existingOrigin
+                    and getattr(args, "remove_origin", False)
+                    and os.path.isfile(checkpointPath)
+                )
+                if (not resumingWithoutOrigin and
+                        (not existingOrigin or safe_url(existingOrigin).rstrip("/") != safe_url(inputTarget).rstrip("/"))):
+                    logger.error("[cloneRepo] Existing clone origin is missing or differs from the submitted URL. Use a new --clone-dir.")
+                    return False
+                if resumingWithoutOrigin:
+                    logger.info("[resume] Continuing interrupted clone after its origin was removed.")
                 logger.info(f"[cloneRepo] Using existing repository: {targetDir}")
             else:
+                sourceType = "remote_clone"
                 logger.info(f"[cloneRepo] Cloning repository to: {targetDir}")
                 print("\nCloning repository (this may take a moment)...")
-                success = cloneRepo(inputTarget, targetDir, githubToken, gitlabToken)
+                success = cloneRepo(
+                    inputTarget, targetDir, githubToken, gitlabToken,
+                    bitbucketToken, branch=requestedBranch
+                )
                 if not success:
                     return False
                 logger.info(f"[cloneRepo] Repository available at: {targetDir}")
+            gitAuthEnv, _authProvider = gitNetworkAuthEnv(
+                inputTarget, githubToken, gitlabToken, bitbucketToken)
+            if sourceType == "existing_clone" and _authProvider and not resumingWithoutOrigin:
+                # Older interrupted runs may have left credentials in origin.
+                # Fetch with the scoped header and a credential-free remote URL.
+                if runGit(["remote", "set-url", "origin", safe_url(inputTarget)], targetDir) is None:
+                    logger.error("[cloneRepo] Could not remove credentials from clone origin URL.")
+                    return False
+            branchReady, branchContext = prepareAnalysisBranch(
+                targetDir, requestedBranch, localRepository=resumingWithoutOrigin,
+                gitAuthEnv=gitAuthEnv)
+            if not branchReady:
+                return False
+            # Keep origin credential-free for future runs and provenance checks.
+            if inputTarget.startswith(("https://", "http://")) and not resumingWithoutOrigin:
+                if runGit(["remote", "set-url", "origin", safe_url(inputTarget)], targetDir) is None:
+                    logger.error("[cloneRepo] Could not remove credentials from clone origin URL.")
+                    return False
         else:
             if not os.path.exists(inputTarget):
                 logger.error(f"[runAnalysis] Path does not exist: {inputTarget}")
@@ -3334,11 +6192,11 @@ def runAnalysis(args: argparse.Namespace) -> bool:
 
         # Smart Git root discovery
         gitDir = os.path.join(targetDir, ".git")
-        if not os.path.isdir(gitDir):
+        if not os.path.exists(gitDir):
             try:
                 for d in os.listdir(targetDir):
                     sub = os.path.join(targetDir, d)
-                    if os.path.isdir(sub) and os.path.isdir(os.path.join(sub, ".git")):
+                    if os.path.isdir(sub) and os.path.exists(os.path.join(sub, ".git")):
                         logger.info(f"[runAnalysis] Found nested .git in: {sub}")
                         targetDir = sub
                         gitDir = os.path.join(targetDir, ".git")
@@ -3346,10 +6204,25 @@ def runAnalysis(args: argparse.Namespace) -> bool:
             except Exception:
                 pass
 
-        isGit = os.path.isdir(gitDir)
+        isGit = os.path.exists(gitDir)
+        if not isUrl and requestedBranch:
+            if not isGit:
+                logger.error("[branch] Branch selection requires a local Git repository.")
+                return False
+            branchReady, branchContext = prepareAnalysisBranch(
+                targetDir, requestedBranch, localRepository=True
+            )
+            if not branchReady:
+                return False
+
+        if not isUrl:
+            # repoName is only set in the URL branch above. Local paths use the
+            # folder name, the same name the report and its output folder use.
+            repoName = os.path.basename(targetDir)
 
         report = {
-            "repo": os.path.basename(targetDir),
+            "repo": repoName if isUrl else os.path.basename(targetDir),
+            "repository_key": repoName if isUrl else os.path.basename(targetDir),
             "target_path": targetDir,
             "mode": args.mode,
             "is_git": isGit,
@@ -3360,9 +6233,80 @@ def runAnalysis(args: argparse.Namespace) -> bool:
         }
         fileList = []
 
+        # The checkpoint lives beside this repository's output artifacts. It is
+        # retained on interruption/failure and removed only after the final
+        # report has been written successfully.
+        prOutDir = os.path.join(args.output_dir, _safeOutputName(repoName))
+        checkpoint = AnalysisCheckpoint(
+            prOutDir, analysisCheckpointSignature(args, targetDir)
+        )
+        noResume = bool(getattr(args, "no_resume", False))
+        if noResume:
+            # --no-resume: forget saved stages and the completion marker, so
+            # every stage runs again and overwrites the checkpoint.
+            checkpoint.data["completed"] = {}
+        completedAnalysis = checkpoint.get("completed_analysis")
+        # Migrate reports produced before persistent completion markers were
+        # introduced. Do this only when there is no interrupted newer run.
+        if (not noResume and completedAnalysis is None
+                and not checkpoint.data["completed"] and args.max_files is None):
+            existingReportFile = os.path.join(prOutDir, f"{repoName}_report.json")
+            try:
+                with open(existingReportFile, "r", encoding="utf-8") as handle:
+                    existingReport = json.load(handle)
+                existingBranch = existingReport.get("ground_truth", {}).get("git", {}).get(
+                    "analysis_branch"
+                )
+                sameTarget = (
+                    os.path.normcase(os.path.abspath(existingReport.get("target_path", "")))
+                    == os.path.normcase(os.path.abspath(targetDir))
+                )
+                sameBranch = not requestedBranch or existingBranch == requestedBranch
+                sameRevision = True
+                if isGit:
+                    currentCommitCount = runGit(["rev-list", "--count", "HEAD"], targetDir)
+                    savedCommitCount = existingReport.get("ground_truth", {}).get("git", {}).get(
+                        "commit_count"
+                    )
+                    sameRevision = bool(
+                        currentCommitCount and currentCommitCount.isdigit()
+                        and int(currentCommitCount) == savedCommitCount
+                    )
+                if (existingReport.get("repository_key") == report["repository_key"]
+                        and existingReport.get("mode") == args.mode
+                        and sameTarget and sameBranch and sameRevision
+                        and isinstance(existingReport.get("full_report_snapshot"), dict)):
+                    checkpoint.markComplete(
+                        existingReport, existingReportFile, targetDir,
+                        existingReport.get("performance", {}).get("total_seconds", 0.0),
+                    )
+                    completedAnalysis = checkpoint.get("completed_analysis")
+                    logger.info("[resume] Registered existing successful report as complete.")
+            except (FileNotFoundError, OSError, ValueError, TypeError):
+                pass
+        if completedAnalysis is not None:
+            completedValue = completedAnalysis["value"]
+            completedReportFile = completedValue.get("report_file", "")
+            if completedReportFile and os.path.isfile(completedReportFile):
+                print(f"[Resume] Already completed; skipping repository: {inputTarget}")
+                if getattr(args, "capture_report", False):
+                    return {
+                        "success": True,
+                        "report": completedValue["report"],
+                        "report_file": completedReportFile,
+                        "target_dir": completedValue.get("target_dir", targetDir),
+                    }
+                return True
+            logger.warning("[resume] Completed report is missing; running the repository again.")
+
         print("[Stage 0] Extracting git metadata...")
-        s0Start = time.time()
-        gitData = runStage0GitAnalysis(targetDir)
+        gitData, stage0Seconds = runCheckpointedStage(
+            checkpoint, "git_metadata", lambda: runStage0GitAnalysis(targetDir)
+        )
+        if branchContext:
+            gitData.update(branchContext)
+        elif isGit:
+            gitData["branch_selection_source"] = "local_current_branch"
         report["ground_truth"]["git"] = {
             "commit_count": gitData.get("commit_count", 0),
             "unique_contributors": gitData.get("unique_contributors", 0),
@@ -3374,61 +6318,173 @@ def runAnalysis(args: argparse.Namespace) -> bool:
             "history_integrity": gitData.get("history_integrity", {}),
             "all_contributors": gitData.get("all_contributors", []),
             "all_contributors_count": len(gitData.get("all_contributors", [])),
+            "default_branch": gitData.get("default_branch"),
+            "analysis_branch": gitData.get("analysis_branch"),
+            "branch_selection_source": gitData.get("branch_selection_source"),
             "source": "git"
         }
-        report["performance"]["stage0_seconds"] = round(time.time() - s0Start, 2)
+        report["performance"]["stage0_seconds"] = round(stage0Seconds, 2)
 
         # Calculate OS-safe outDir matching saveReport logic
-        repoName = os.path.basename(os.path.abspath(targetDir))
-        if isUrl:
-            safeName = inputTarget.rstrip("/").split("/")[-1].replace(".git", "")
-            prOutDir = os.path.join(args.output_dir, safeName)
-        else:
-            prOutDir = os.path.join(args.output_dir, repoName)
-
         gitlab_info = extractGitLabRepoInfo(targetDir, inputTarget)
+        bitbucket_info = None if gitlab_info else extractBitbucketRepoInfo(targetDir, inputTarget)
+
+        # Collect provider facts and preserve origin before collaboration analysis
+        # or optional credential cleanup can change the local repository.
+        providerData = {}
+        print("[Provenance] Checking public-origin evidence...")
+        provenanceResult, _provenanceSeconds = runCheckpointedStage(
+            checkpoint,
+            "provenance",
+            lambda: analyze_provenance(
+                targetDir, inputTarget, github_token=githubToken, provider_metadata=providerData,
+                gitlab_token=gitlabToken, bitbucket_token=bitbucketToken,
+                provider=getattr(args, "provenance_provider", None),
+                provider_instance_url=getattr(args, "provenance_instance_url", None),
+                atlassian_org_id=getattr(args, "atlassian_org_id", None) or os.getenv("ATLASSIAN_ORG_ID"),
+                atlassian_admin_token=os.getenv("ATLASSIAN_ADMIN_TOKEN"),
+                offline=getattr(args, "provenance_offline", False),
+                evidence_paths=getattr(args, "provenance_evidence", None),
+                public_reference_paths=getattr(args, "public_reference", None),
+                audit_log=getattr(args, "provenance_audit_log", False),
+                personal_security_profile=getattr(args, "github_security_log_profile", None),
+                search_public_commits=getattr(args, "provenance_search_commits", False),
+            ),
+        )
+        report["provenance"] = provenanceResult
+        report["github_api"] = report["provenance"]["provider_metadata"]
+        report["provenance_artifacts"] = save_provenance(report["provenance"], prOutDir)
+        if report["provenance_artifacts"].get("pdf"):
+            print(f"[Provenance] Client PDF: {report['provenance_artifacts']['pdf']}")
+
         if gitlab_info:
             print("[Stage 0.5] Running GitLab MR analytics...")
-            s05Start = time.time()
-            prMetrics = runGitLabMrAnalysis(targetDir, inputTarget, gitlabToken, prOutDir)
+            prMetrics, stage05Seconds = runCheckpointedStage(
+                checkpoint, "collaboration",
+                lambda: runGitLabMrAnalysis(targetDir, inputTarget, gitlabToken, prOutDir),
+            )
             report["github_prs"] = prMetrics
-            report["performance"]["stage0_5_seconds"] = round(time.time() - s05Start, 2)
+            report["performance"]["stage0_5_seconds"] = round(stage05Seconds, 2)
+        elif bitbucket_info:
+            print("[Stage 0.5] Running Bitbucket PR analytics...")
+            prMetrics, stage05Seconds = runCheckpointedStage(
+                checkpoint, "collaboration",
+                lambda: runBitbucketPrAnalysis(targetDir, inputTarget, bitbucketToken, prOutDir),
+            )
+            report["github_prs"] = prMetrics
+            report["performance"]["stage0_5_seconds"] = round(stage05Seconds, 2)
         else:
             print("[Stage 0.5] Running GitHub PR analytics...")
-            s05Start = time.time()
-            prMetrics = runGitHubPrAnalysis(targetDir, inputTarget, githubToken, prOutDir)
+            prMetrics, stage05Seconds = runCheckpointedStage(
+                checkpoint, "collaboration",
+                lambda: runGitHubPrAnalysis(targetDir, inputTarget, githubToken, prOutDir),
+            )
             report["github_prs"] = prMetrics
-            report["performance"]["stage0_5_seconds"] = round(time.time() - s05Start, 2)
+            report["performance"]["stage0_5_seconds"] = round(stage05Seconds, 2)
+
+        mergeCommitIdentities = prMetrics.pop("_merge_commit_identities", {})
+        commitRows = gitData.get("all_commits_detailed", [])
+        attachMergeCommitUsernames(commitRows, mergeCommitIdentities)
+        normalizeCommitAuthorsToUsernames(commitRows)
+        dumpCommitsCsv(prOutDir, sanitizeFilename(repoName), commitRows)
+        extractionInventory = extractLocalHistoryAndAutomation(
+            targetDir, prOutDir, repoName, commitRows
+        )
+        report["supplemental_extraction"] = {
+            "git_history_commit_count": len(extractionInventory["git_history"]["commits"]),
+            "branch_count": len(extractionInventory["git_history"]["branches"]),
+            "tag_count": len(extractionInventory["git_history"]["tags"]),
+            "test_file_count": len(extractionInventory["tests_ci_inventory"]["test_files"]),
+            "ci_configuration_file_count": len(extractionInventory["tests_ci_inventory"]["ci_configuration_files"]),
+            "retained_test_report_count": len(extractionInventory["tests_ci_inventory"]["retained_test_or_coverage_reports"]),
+        }
+
+        originCleanup = removeOriginRemote(targetDir) if getattr(args, "remove_origin", False) else {
+            "origin_present": bool(runGit(["config", "--get", "remote.origin.url"], targetDir)),
+            "origin_removed": False, "status": "preserved", "error": "",
+        }
+        originAudit = {
+            "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "repository_name": os.path.basename(os.path.abspath(targetDir)),
+            "source_type": sourceType,
+            "repository_target": _redactAuditTarget(inputTarget),
+            "local_path": os.path.abspath(targetDir),
+            **originCleanup,
+        }
+        originAuditPath = getattr(
+            args,
+            "origin_cleanup_csv",
+            os.path.join(args.output_dir, "origin_remote_cleanup.csv"),
+        )
+        writeOriginCleanupAudit(originAuditPath, originAudit)
+        if originCleanup["status"] == "removed":
+            logger.info(f"[originCleanup] Removed origin remote from: {targetDir}")
+        elif originCleanup["status"] == "not_present":
+            logger.info(f"[originCleanup] No origin remote present in: {targetDir}")
+        elif originCleanup["status"] == "failed":
+            logger.warning(
+                f"[originCleanup] Could not remove origin from {targetDir}: "
+                f"{originCleanup.get('error', 'unknown error')}"
+            )
+        
+        report["origin_cleanup"] = originAudit 
 
         print("[Stage 1] Scanning repository structure and signals...")
-        stage1Data, fileList = runStage1Analysis(targetDir, maxFiles=args.max_files)
+        stage1Payload, _stage1Seconds = runCheckpointedStage(
+            checkpoint, "repository_scan",
+            lambda: runStage1Analysis(targetDir, maxFiles=args.max_files),
+        )
+        stage1Data, fileList = stage1Payload
         report["heuristics"]["signals"] = stage1Data.get("signals", {})
         report["heuristics"]["structure"] = stage1Data.get("structure", {})
 
-        print("[Layer 1] Fetching ground truth via cloc...")
-        clocData = runCloc(targetDir, fileList=fileList)
-        if clocData and "SUM" in clocData:
+        print("[Layer 1] Fetching total and authored LOC via SCC...")
+        sccPayload, _sccSeconds = runCheckpointedStage(
+            checkpoint, "scc",
+            lambda: {
+                "total": runScc(targetDir, authoredOnly=False),
+                "authored": runScc(targetDir, authoredOnly=True),
+            },
+        )
+        totalSccData = sccPayload["total"]
+        authoredSccData = sccPayload["authored"]
+        authoredCodeFiles = authoredSccData.get("source_files", [])
+        if totalSccData.get("totals") and authoredSccData.get("totals"):
+            totalStats = totalSccData["totals"]
+            # This is the exact filtered SCC Code total requested by the LOC
+            # policy. Source-code tokens use the narrower source_files manifest;
+            # SCC-recognized docs/configs remain separate token categories.
+            authoredStats = authoredSccData["totals"]
+            authoredLoc = authoredStats["code"]
+            totalLoc = totalStats["code"]
+            nonAuthoredLoc = max(0, totalLoc - authoredLoc)
             report["ground_truth"]["loc"] = {
-                "value": clocData["SUM"]["code"],
+                "value": authoredLoc,
                 "breakdown": {
-                    "code": clocData["SUM"]["code"],
-                    "comment": clocData["SUM"]["comment"],
-                    "blank": clocData["SUM"]["blank"],
-                    "nFiles": clocData["SUM"]["nFiles"]
+                    "authored": authoredLoc,
+                    "non_authored": nonAuthoredLoc,
+                    "total": totalLoc,
+                    "comment": totalStats["comment"],
+                    "blank": totalStats["blank"],
+                    "nFiles": totalStats["nFiles"],
+                    "authored_comment": authoredStats["comment"],
+                    "authored_blank": authoredStats["blank"],
+                    "authored_nFiles": authoredStats["nFiles"],
                 },
-                "source": "cloc"
+                "source": "scc",
+                "definition": (
+                    "Authored LOC excludes SCC-detected generated files and configured "
+                    "non-authored dependency/vendor/build/migration directories."
+                ),
             }
 
-            # Map cloc breakdown to languages
+            # Language analysis follows the authored/eligible SCC population.
             langBreakdown = {}
-            for lang, stats in clocData.items():
-                if lang in ("SUM", "header"):
-                    continue
-                sum_code = clocData["SUM"]["code"]
+            for lang, stats in authoredSccData.get("languages", {}).items():
                 langBreakdown[lang] = {
                     "loc": stats["code"],
                     "files": stats["nFiles"],
-                    "pct": round((stats["code"] / sum_code * 100), 2) if sum_code > 0 else 0
+                    "pct": round((stats["code"] / authoredLoc * 100), 2) if authoredLoc > 0 else 0
                 }
 
             # Differentiate between core (code) and total (all) languages
@@ -3440,11 +6496,12 @@ def runAnalysis(args: argparse.Namespace) -> bool:
                 "core_list": coreLangs,
                 "list": list(langBreakdown.keys()),
                 "breakdown": langBreakdown,
-                "source": "cloc"
+                "source": "scc"
             }
         else:
-            logger.warning("[Layer 1] Cloc failed or returned empty. Falling back to heuristic scan.")
-            report["ground_truth"]["loc"] = {"value": 0, "source": "none", "notes": "cloc failure"}
+            logger.warning("[Layer 1] SCC failed or returned empty; verified LOC is unavailable.")
+            authoredCodeFiles = []
+            report["ground_truth"]["loc"] = {"value": 0, "source": "none", "notes": "scc failure"}
             report["ground_truth"]["languages"] = {
                 "count": 0,
                 "list": [],
@@ -3457,15 +6514,36 @@ def runAnalysis(args: argparse.Namespace) -> bool:
 
         if args.mode in {"stage2", "full"}:
             print("[Stage 2] Running deep analysis (Tokens & Duplication)...")
+            stage2Payload, stage2Seconds = runCheckpointedStage(
+                checkpoint, "deep_analysis",
+                lambda: runStage2Analysis(
+                    fileList, authoredCodeFiles=authoredCodeFiles
+                ),
+            )
+            stage2Result, fileStats, fileTokensMap, framework_findings = stage2Payload
             s2Start = time.time()
-
-            stage2Result, fileStats, fileTokensMap, framework_findings = runStage2Analysis(fileList)
+            llmMetrics = stage2Result.get("metrics", {}).get("llm_tokens", {})
+            lexicalMetrics = stage2Result.get("metrics", {}).get("lexical_tokens", {})
+            repoLlmTokens = llmMetrics.get("total", 0)
+            repoLexicalTokens = lexicalMetrics.get("total", 0)
+            prLlmTokens = prMetrics.get("pr_content_tokens", {}).get("total", 0)
+            prLexicalTokens = prMetrics.get("pr_content_tokens_lexical", {}).get("total", 0)
             report["tool_metrics"]["tokens"] = {
-                "llm": stage2Result.get("metrics", {}).get("llm_tokens", {}).get("total", 0),
-                "lexical": stage2Result.get("metrics", {}).get("lexical_tokens", {}).get("total", 0)
+                "llm": repoLlmTokens + prLlmTokens,
+                "llm_repository": repoLlmTokens,
+                "llm_code": llmMetrics.get("code", 0),
+                "llm_docs": llmMetrics.get("docs", 0),
+                "llm_config": llmMetrics.get("config", 0),
+                "llm_pr": prLlmTokens,
+                "lexical": repoLexicalTokens + prLexicalTokens,
+                "lexical_repository": repoLexicalTokens,
+                "lexical_code": lexicalMetrics.get("code", 0),
+                "lexical_docs": lexicalMetrics.get("docs", 0),
+                "lexical_config": lexicalMetrics.get("config", 0),
+                "lexical_pr": prLexicalTokens,
             }
             report["tool_metrics"]["duplication"] = stage2Result.get("duplication_metrics", {})
-            report["performance"]["stage2_seconds"] = round(time.time() - s2Start, 2)
+            report["performance"]["stage2_seconds"] = round(stage2Seconds, 2)
 
             print("[Layer 3] Computing heuristic scores (AI detection, Rating)...")
             aiData = runAiDetectionAnalysis(
@@ -3505,7 +6583,7 @@ def runAnalysis(args: argparse.Namespace) -> bool:
             }
             report["heuristics"]["complexity"] = computeComplexityScore(
                 loc_val,
-                report["tool_metrics"]["tokens"]["llm"],
+                report["tool_metrics"]["tokens"]["llm_repository"],
                 len(fileList)
             )
             report["tool_metrics"]["code_age"] = analyzeCodeAge(targetDir, fileList)
@@ -3520,25 +6598,17 @@ def runAnalysis(args: argparse.Namespace) -> bool:
 
         if args.mode in {"full"}:
             print("[Stage 5] Scanning for secrets...")
-            s5Start = time.time()
-            secretData = scanSecrets(fileList)
+            secretData, stage5Seconds = runCheckpointedStage(
+                checkpoint, "secret_scan", lambda: scanSecrets(fileList)
+            )
             report["tool_metrics"]["secrets"] = secretData
-            report["performance"]["stage5_seconds"] = round(time.time() - s5Start, 2)
-
-        if isUrl:
-            gitlab_info = extractGitLabRepoInfo(targetDir, inputTarget)
-            if gitlab_info:
-                domain, project_path, _ = gitlab_info
-                print("[GitLab API] Enriching via GitLab REST API...")
-                glData = enrichViaGitLabApi(domain, project_path, gitlabToken)
-                report["github_api"] = glData
-            elif githubToken or HAS_PYGITHUB:
-                print("[GitHub API] Enriching via GitHub REST API...")
-                ghData = enrichViaGithubApi(inputTarget, githubToken)
-                report["github_api"] = ghData
+            report["performance"]["stage5_seconds"] = round(stage5Seconds, 2)
 
         report["performance"]["total_seconds"] = round(time.time() - startTime, 2)
         outFile = saveReport(report, targetDir, inputTarget, args.output_dir, isUrl)
+        checkpoint.markComplete(
+            report, outFile, targetDir, report["performance"]["total_seconds"]
+        )
 
         gt = report.get("ground_truth", {})
         tm = report.get("tool_metrics", {})
@@ -3546,6 +6616,11 @@ def runAnalysis(args: argparse.Namespace) -> bool:
 
         loc_val = gt.get("loc", {}).get("value", 0)
         llm_tok = tm.get("tokens", {}).get("llm", 0)
+        repo_llm_tok = tm.get("tokens", {}).get("llm_repository", llm_tok)
+        pr_llm_tok = tm.get("tokens", {}).get("llm_pr", 0)
+        lexical_tok = tm.get("tokens", {}).get("lexical", 0)
+        repo_lexical_tok = tm.get("tokens", {}).get("lexical_repository", lexical_tok)
+        pr_lexical_tok = tm.get("tokens", {}).get("lexical_pr", 0)
         commits = gt.get("git", {}).get("commit_count", "N/A")
         persons = gt.get("git", {}).get("unique_contributors", "N/A")
         all_persons = gt.get("git", {}).get("all_contributors_count", "N/A")
@@ -3572,8 +6647,15 @@ def runAnalysis(args: argparse.Namespace) -> bool:
         print("\n" + "=" * 44)
         print("  Analysis Complete — v3.0.0 (Production Refactor)")
         print("=" * 44)
-        print(f"  LOC (Verified)   : {loc_val:,}")
-        print(f"  LLM Tokens       : {llm_tok:,}")
+        non_authored_loc = gt.get("loc", {}).get("breakdown", {}).get("non_authored", 0)
+        print(f"  Authored LOC     : {loc_val:,}")
+        print(f"  Non-Authored LOC : {non_authored_loc:,}")
+        print(f"  LLM Tokens (Repo): {repo_llm_tok:,}")
+        print(f"  LLM Tokens (PRs) : {pr_llm_tok:,}")
+        print(f"  LLM Tokens Total : {llm_tok:,}")
+        print(f"  Lexical (Repo)   : {repo_lexical_tok:,}")
+        print(f"  Lexical (PRs)    : {pr_lexical_tok:,}")
+        print(f"  Lexical Total    : {lexical_tok:,}")
         print(f"  Commits          : {commits}")
         print(f"  Contributors (U) : {persons}")
         print(f"  Contributors (All): {all_persons}")
@@ -3584,7 +6666,18 @@ def runAnalysis(args: argparse.Namespace) -> bool:
         print(f"  Secrets found    : {sec_count}")
         print(f"  Open Source      : {is_os}")
         print(f"  Git History OK   : {git_ok}")
-        pr_label = "GitLab MRs" if gitlab_info else "GitHub PRs"
+        print(f"  Public Origin    : {report['provenance']['status']}")
+        print(f"  Provenance Gate  : {report['provenance']['recommendation']}")
+        estimate = report["provenance"].get("public_exposure_estimate", {})
+        if estimate.get("status") == "ESTIMATE":
+            score = estimate.get("likelihood_percent")
+            print(f"  Exposure Estimate: {str(score) + '%' if score is not None else 'insufficient observations'} (heuristic; not confirmed)")
+        if gitlab_info:
+            pr_label = "GitLab MRs"
+        elif bitbucket_info:
+            pr_label = "Bitbucket PRs"
+        else:
+            pr_label = "GitHub PRs"
         print(f"  {pr_label} (Tot) : {pr_total}")
         print(f"  {pr_label} (Opn) : {pr_open}")
         print(f"  {pr_label} (Cld) : {pr_closed}")
@@ -3594,11 +6687,209 @@ def runAnalysis(args: argparse.Namespace) -> bool:
             print(f"  Repo cloned to   :\n  {targetDir}")
         print("=" * 44)
 
+        if getattr(args, "capture_report", False):
+            return {
+                "success": True,
+                "report": report,
+                "report_file": outFile,
+                "target_dir": targetDir,
+            }
         return True
 
     except KeyboardInterrupt:
         print("\n[!] Pipeline interrupted safely.")
+        raise
+    except Exception as e:
+        logger.error(f"[runAnalysis] Pipeline failed for '{inputTarget}': {e}", exc_info=True)
+        print(f"\n[!] Analysis failed for {inputTarget}: {e}")
         return False
+
+
+def _safeOutputName(value: str) -> str:
+    """Return a stable directory-safe name for a user supplied project name."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._")
+    return safe or "project"
+
+
+def provenanceOptions(args: argparse.Namespace) -> Dict[str, Any]:
+    """Keep single, batch and project runs aligned on evidence collection."""
+    return {key: getattr(args, key, default) for key, default in {
+        "provenance_offline": False, "provenance_evidence": [],
+        "public_reference": [], "provenance_audit_log": False,
+        "github_security_log_profile": None,
+        "provenance_search_commits": False, "remove_origin": False,
+        "provenance_provider": None, "provenance_instance_url": None,
+        "atlassian_org_id": None,
+    }.items()}
+
+
+class AuditPreflightDeclined(ValueError):
+    """The user declined an analysis without verified organization audit access."""
+
+
+def preflightGithubAuditAccess(args: argparse.Namespace, targets: List[str], *,
+                              client: Optional[Any] = None,
+                              prompt: Optional[Any] = None) -> None:
+    """Check each GitHub organization's audit API before cloning or analysis."""
+    if not getattr(args, "provenance_audit_log", False) or getattr(args, "provenance_offline", False):
+        return
+    names_by_owner: Dict[str, str] = {}
+    for target in targets:
+        source = target
+        if os.path.isdir(target):
+            source = runGit(["config", "--get", "remote.origin.url"], target) or ""
+        name = github_name(source)
+        if name:
+            names_by_owner.setdefault(name.split("/", 1)[0].lower(), name)
+    if not names_by_owner:
+        print("[Audit preflight] No GitHub owner identified; continuing with available provenance checks.")
+        return
+
+    token = getattr(args, "github_token", None) or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    client = client or GitHubClient(token)
+    failures = []
+    verified = []
+    for owner, name in names_by_owner.items():
+        metadata = client.get("/repos/" + name, authenticated=bool(token))
+        data = metadata.get("data")
+        owner_type = ((data.get("owner") or {}).get("type") if
+                      metadata.get("status") == 200 and isinstance(data, dict) else None)
+        if owner_type not in {"Organization", "User"}:
+            identity = client.get("/users/" + owner, authenticated=False)
+            identity_data = identity.get("data")
+            owner_type = (identity_data.get("type") if
+                          identity.get("status") == 200 and isinstance(identity_data, dict) else None)
+        if owner_type == "User":
+            print(f"[Audit preflight] {owner}: personal account; organization audit check skipped.")
+            continue
+        if owner_type != "Organization":
+            failures.append(f"{owner}: owner type could not be verified")
+            continue
+        if not token:
+            failures.append(f"{owner}: GitHub PAT is missing")
+            continue
+        result = client.get(f"/orgs/{owner}/audit-log?include=web&per_page=1")
+        if result.get("status") == 200 and isinstance(result.get("data"), list):
+            verified.append(owner)
+        else:
+            failures.append(f"{owner}: audit API access not verified (status: {result.get('status')})")
+
+    if verified:
+        print("[Audit preflight] Audit API access verified for: " + ", ".join(verified))
+    if not failures:
+        return
+    print("[Audit preflight] Organization audit access is unavailable or unverified:")
+    for failure in failures:
+        print("  - " + failure)
+    print("Provenance checks will still run, but historical audit confirmation may be missing.")
+    if getattr(args, "allow_provenance_without_audit", False):
+        print("[Audit preflight] Continuing as requested by --allow-provenance-without-audit.")
+        return
+    try:
+        answer = (prompt or input)("Continue without verified audit access? [y/N]: ").strip().lower()
+    except EOFError as exc:
+        raise AuditPreflightDeclined(
+            "Audit access was not verified and no confirmation was available. "
+            "Use --allow-provenance-without-audit to continue non-interactively.") from exc
+    if answer not in {"y", "yes"}:
+        raise AuditPreflightDeclined("Analysis stopped because organization audit access was not verified.")
+
+
+def runProjectsAnalysis(args: argparse.Namespace) -> str:
+    """Analyze and evaluate all projects declared in a user-friendly CSV."""
+    from project_acceptance import (
+        evaluate_project,
+        evaluate_repository,
+        load_policy,
+        load_projects_csv,
+        normalize_repository_metrics,
+        print_portfolio_summary,
+        save_combined_legacy,
+        save_portfolio_results,
+        update_legacy_acceptance,
+    )
+
+    projects = load_projects_csv(args.projects)
+    preflightGithubAuditAccess(args, [repo["target"] for project in projects
+                                    for repo in project["repositories"]])
+    policy = load_policy(getattr(args, "policy", None))
+    total_repositories = sum(len(project["repositories"]) for project in projects)
+
+    print("\nProject Input Summary")
+    print("=" * 44)
+    print(f"Projects     : {len(projects)}")
+    print(f"Repositories : {total_repositories}")
+    for project in projects:
+        print(f"  - {project['name']}: {len(project['repositories'])} repo(s)")
+    print("=" * 44)
+
+    project_results = []
+    project_outputs = []
+    for project_index, project in enumerate(projects, 1):
+        print(f"\n[Project {project_index}/{len(projects)}] {project['name']}")
+        repo_results = []
+        safe_project_name = _safeOutputName(project["name"])
+        project_output = os.path.join(args.output_dir, safe_project_name)
+        clone_base = args.clone_dir if args.clone_dir else os.path.join(os.getcwd(), "cloned_repos")
+        project_clone_dir = os.path.join(clone_base, safe_project_name)
+
+        for repo_index, repository in enumerate(project["repositories"], 1):
+            print(
+                f"\n[Repository {repo_index}/{len(project['repositories'])}] "
+                f"{repository['name']} "
+                f"(branch: {repository.get('branch') or 'repository default'})"
+            )
+            repo_args = argparse.Namespace(
+                input=repository["target"],
+                output_dir=project_output,
+                clone_dir=project_clone_dir,
+                branch=repository.get("branch"),
+                mode=args.mode,
+                max_files=args.max_files,
+                github_token=args.github_token,
+                gitlab_token=args.gitlab_token,
+                bitbucket_token=args.bitbucket_token,
+                origin_cleanup_csv=os.path.join(
+                    args.output_dir, "origin_remote_cleanup.csv"
+                ),
+                capture_report=True,
+                audit_preflight_complete=True,
+                no_resume=getattr(args, "no_resume", False),
+                **provenanceOptions(args),
+            )
+            analysis = runAnalysis(repo_args)
+            if not isinstance(analysis, dict) or not analysis.get("success"):
+                repo_results.append({
+                    "name": repository["name"],
+                    "target": repository["target"],
+                    "branch": repository.get("branch"),
+                    "decision": "ANALYSIS_ERROR",
+                    "metrics": {},
+                    "checks": [],
+                    "error": "Repository analysis did not complete",
+                })
+                continue
+
+            metrics = normalize_repository_metrics(analysis["report"])
+            evaluation = evaluate_repository(metrics, policy)
+            repo_results.append({
+                "name": repository["name"],
+                "target": repository["target"],
+                "branch": repository.get("branch"),
+                "report_file": analysis["report_file"],
+                "metrics": metrics,
+                **evaluation,
+            })
+
+        project_result = evaluate_project(project, repo_results, policy)
+        project_results.append(project_result)
+        update_legacy_acceptance(project_output, project_result)
+        project_outputs.append((project_result, project_output))
+
+    saved = save_portfolio_results(project_results, args.output_dir)
+    saved["combined_legacy"] = save_combined_legacy(project_outputs, args.output_dir)
+    print_portfolio_summary(project_results, saved)
+    return saved["decision"]
 
 
 def main():
@@ -3639,6 +6930,12 @@ Examples:
   Batch-analyse from a text file (one URL/path per line):
     python Repo_analysis_tool.py --batch repos.txt -o ./reports
 
+  Evaluate one or more projects from a simple CSV:
+    python Repo_analysis_tool.py --projects projects.csv --mode full
+
+  Create the projects CSV through an interactive wizard:
+    python Repo_analysis_tool.py --project-wizard
+
   Stage 1 structure-only pre-check:
     python Repo_analysis_tool.py -i ./my-app --mode stage1
         """,
@@ -3648,6 +6945,8 @@ Examples:
                         help="Output directory for reports (default: ./outputs)")
     parser.add_argument("--clone-dir", "-c", type=str, default=None,
                         help="Base directory for cloned repositories (default: ./cloned_repos)")
+    parser.add_argument("--branch", type=str, default=None,
+                        help="Exact branch to analyze (URL: remote default; local path: current branch when omitted)")
     parser.add_argument("--mode", "-m", choices=["stage1", "stage2", "full"], default="full",
                         help="Pipeline mode: stage1=structure, stage2=deep, full=all (default: full)")
     parser.add_argument("--max-files", type=int, default=None,
@@ -3656,16 +6955,61 @@ Examples:
                         help="GitHub Personal Access Token for API enrichment (needed for private repos)")
     parser.add_argument("--gitlab-token", type=str, default=None,
                         help="GitLab Personal Access Token for API enrichment (needed for private repos)")
+    parser.add_argument("--bitbucket-token", type=str, default=None,
+                    help="Bitbucket App Password / Access Token for API enrichment (needed for private repos)")
     parser.add_argument("--batch", type=str, default=None,
                         help="Path to a text file containing one repo URL or local path per line")
+    parser.add_argument("--projects", type=str, default=None,
+                        help="CSV with project_name, repo_url, and branch columns")
+    parser.add_argument("--project-wizard", action="store_true",
+                        help="Interactively create a projects CSV and analyze it")
+    parser.add_argument("--wizard-output", type=str, default="projects.csv",
+                        help="CSV path created by --project-wizard (default: projects.csv)")
+    parser.add_argument("--policy", type=str, default=None,
+                        help="Optional JSON/YAML acceptance-policy override")
+    parser.add_argument("--provenance-offline", action="store_true",
+                        help="Skip network requests in the provenance stage; other analysis stages retain provider access")
+    parser.add_argument("--provenance-evidence", action="append", default=[],
+                        help="GitHub/GH Archive raw JSON/JSONL(.gz) file; repeatable, filtered per repository")
+    parser.add_argument("--public-reference", action="append", default=[],
+                        help="Local known-public reference directory for commit/source comparison; repeatable")
+    parser.add_argument("--provenance-audit-log", action="store_true",
+                        help="Read organization audit API; personal GitHub accounts use provenance signals")
+    parser.add_argument("--allow-provenance-without-audit", action="store_true",
+                        help="Continue non-interactively if GitHub organization audit access cannot be verified")
+    parser.add_argument("--github-security-log-profile", type=str, default=None,
+                        help="Deprecated and ignored; personal browser Security-log collection is disabled")
+    parser.add_argument("--provenance-provider", choices=["gitlab", "bitbucket_cloud", "bitbucket_server"],
+                        help="Explicit provider for a self-hosted repository")
+    parser.add_argument("--provenance-instance-url", default=None,
+                        help="Explicit trusted HTTPS provider instance/context URL for self-hosted provenance access")
+    parser.add_argument("--atlassian-org-id", default=None,
+                        help="Atlassian organization ID for Bitbucket Cloud audits; uses ATLASSIAN_ADMIN_TOKEN from environment")
+    parser.add_argument("--provenance-search-commits", action="store_true",
+                        help="Opt in to sending sampled commit hashes to anonymous GitHub public search")
+    parser.add_argument("--remove-origin", action="store_true",
+                        help="Explicitly remove origin URLs/tracking after provenance is saved (default: preserve)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore saved checkpoints and finished results; analyze every repository from the beginning")
 
     if len(sys.argv) == 1:
+        try:
+            validateSccVersion()
+        except RuntimeError as exc:
+            print(f"[!] {exc}")
+            sys.exit(1)
         while True:
             args = runInteractiveMode()
             if not args:
                 break
 
-            runAnalysis(args)
+            try:
+                runAnalysis(args)
+            except AuditPreflightDeclined as exc:
+                print(f"[!] {exc}")
+                break
+            except KeyboardInterrupt:
+                break
 
             print("\nWhat would you like to do next?")
             print("1. Analyze another repository")
@@ -3676,15 +7020,45 @@ Examples:
                 break
     else:
         args = parser.parse_args()
+        try:
+            validateSccVersion()
+        except RuntimeError as exc:
+            print(f"[!] {exc}")
+            sys.exit(1)
         if args.input:
             args.input = args.input.strip().strip('"')
 
-        if args.batch:
+        if args.project_wizard:
+            from project_acceptance import create_projects_csv_wizard, load_projects_csv
+            args.projects = create_projects_csv_wizard(args.wizard_output)
+            wizard_projects = load_projects_csv(args.projects)
+            wizard_repo_count = sum(len(p["repositories"]) for p in wizard_projects)
+            print(f"\nSaved {len(wizard_projects)} project(s) and {wizard_repo_count} repository/repositories to:")
+            print(f"  {args.projects}")
+            if input("Start analysis now? [Y/n]: ").strip().lower() in {"n", "no"}:
+                return
+
+        if args.projects:
+            try:
+                decision = runProjectsAnalysis(args)
+            except ValueError as exc:
+                print(f"[!] {exc}")
+                sys.exit(2)
+            except KeyboardInterrupt:
+                sys.exit(130)
+            sys.exit(0 if decision == "ACCEPT" else 1 if decision == "REJECT" else 3)
+
+        elif args.batch:
             if not os.path.isfile(args.batch):
                 print(f"[!] Batch file not found: {args.batch}")
                 sys.exit(1)
             with open(args.batch, "r", encoding="utf-8") as f:
                 targets = [line.strip().strip('"') for line in f if line.strip() and not line.startswith("#")]
+            try:
+                preflightGithubAuditAccess(args, targets)
+            except AuditPreflightDeclined as exc:
+                print(f"[!] {exc}")
+                sys.exit(2)
             print(f"[Batch] Processing {len(targets)} repositories...")
             success_count = 0
             for idx, target in enumerate(targets, 1):
@@ -3693,18 +7067,35 @@ Examples:
                     input=target,
                     output_dir=args.output_dir,
                     clone_dir=args.clone_dir,
+                    branch=None,
                     mode=args.mode,
                     max_files=args.max_files,
                     github_token=args.github_token,
                     gitlab_token=args.gitlab_token,
+                    bitbucket_token=args.bitbucket_token,
+                    audit_preflight_complete=True,
+                    no_resume=getattr(args, "no_resume", False),
+                    **provenanceOptions(args),
+                    origin_cleanup_csv=os.path.join(
+                        args.output_dir, "origin_remote_cleanup.csv"
+                    ),
                 )
-                if runAnalysis(batch_args):
-                    success_count += 1
+                try:
+                    if runAnalysis(batch_args):
+                        success_count += 1
+                except KeyboardInterrupt:
+                    sys.exit(130)
             print(f"\n[Batch] Completed: {success_count}/{len(targets)} succeeded.")
             print(f"[Batch] Summary CSV: {os.path.join(args.output_dir, 'summary_all.csv')}")
 
         elif args.input:
-            runAnalysis(args)
+            try:
+                runAnalysis(args)
+            except AuditPreflightDeclined as exc:
+                print(f"[!] {exc}")
+                sys.exit(2)
+            except KeyboardInterrupt:
+                sys.exit(130)
 
         else:
             parser.print_help()
