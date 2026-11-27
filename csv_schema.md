@@ -2,20 +2,39 @@
 
 This document explains the meaning behind the columns generated in the `summary_all.csv` and `summary_metadata.csv` outputs by the Repository Analysis Tool.
 
+## Public-origin provenance (all summary and legacy CSVs)
+
+* **repository_key**: Original repository name used to label the analysis outputs and summary rows.
+* **provenance_provider / provenance_instance_url**: Provider adapter and source instance used to scope repository identity and native audit matching.
+* **provenance_status**: `PUBLIC_EXPOSURE_EVIDENCE`, `PUBLIC_CODE_MATCH`, or `INCONCLUSIVE`. No value certifies lifetime privacy.
+* **provenance_recommendation**: `REJECT` for repository-level public evidence; otherwise `MANUAL_REVIEW`.
+* **ever_public**: CSV `True` only when positive repository-level evidence exists; otherwise `UNKNOWN`. In JSON the unknown value remains `null`, never false.
+* **public_to_private_transition**: CSV `True` only for a matching explicit public-to-private audit event; otherwise `UNKNOWN`. `UNKNOWN` does not mean the transition never happened.
+* **provenance_evidence_count**: Number of retained evidence details (capped at 500).
+* **provenance_reasons**: Finding kinds (including confirmed audit transitions) plus contributing estimated clues prefixed `heuristic:`. Details, timestamps, IDs, source hashes, weights and limitations are in `provenance.json`.
+
+The project acceptance check `private_provenance` fails on exposure evidence and
+remains `UNKNOWN` otherwise. See [PROVENANCE.md](./PROVENANCE.md) for investigation
+and interpretation instructions.
+
 ## General Information
 *   **repo_name**: The name of the analyzed repository or folder.
 *   **is_git**: Boolean (`True`/`False`) indicating whether a `.git` folder and valid git history were found.
 *   **license_type**: Detected open-source or commercial license (e.g., MIT, Apache License, Unknown).
+    Project acceptance rejects the repository when any license is detected.
 
 ## Git Metadata & Timeline
 *   **first_commit_date**: Timestamp of the very first commit in the repository.
 *   **last_commit_date**: Timestamp of the most recent commit.
 *   **development_span_months**: The active lifespan of the repository in months (from first commit to last).
-*   **commits**: Total number of commits across the default branch.
+*   **commits**: Total number of commits reachable from the selected analysis branch.
 *   **meaningful_commit_count**: Commits excluding generic/boilerplate messages like "Update README" or "Merge branch".
 *   **commits_per_month**: Average commit velocity per active month.
 *   **branch_count**: Total number of git branches discovered in the local repository.
 *   **git_history_intact**: Boolean indicating if the git history appears continuous without suspicious single-bulk commits or extreme force-pushes.
+*   **default_branch**: Default branch advertised by the cloned repository's `origin` remote.
+*   **analysis_branch**: Branch whose checked-out files were used for LOC, token, framework, and repository analysis.
+*   **branch_selection_source**: `repository_default`, `requested`, or `local_current_branch`.
 
 ## Contributors
 *   **contributors**: Count of unique contributor email addresses extracted from Git history. Note that developers using multiple emails might be counted multiple times.
@@ -23,12 +42,19 @@ This document explains the meaning behind the columns generated in the `summary_
 *   **all_contributors**: A comma-separated list of contributor names (truncated in the terminal, full list in CSV).
 
 ## Code Size & Tokens
-*   **loc_code**: Lines of executable code (verified via CLOC).
-*   **loc_comment**: Lines of comments and docstrings.
-*   **loc_blank**: Blank lines in the codebase.
-*   **loc_files**: Total number of source files analyzed.
-*   **tokens_llm**: Count of tokens calculated using the `cl100k_base` (GPT-4) tokenizer. Useful for LLM context window sizing.
-*   **lexical_token**: Raw count of code symbols, operators, and identifiers.
+*   **authored_loc**: The filtered SCC `--no-gen` Code total. It excludes SCC-detected generated files and the configured non-authored directories.
+*   **non_authored_loc**: Total SCC repository code LOC minus `authored_loc`; under the business definition this includes generated, vendor, dependency, build, migration, and other configured excluded code.
+*   **loc_comment**: Total repository comment LOC reported by SCC.
+*   **loc_blank**: Total repository blank LOC reported by SCC.
+*   **loc_files**: Total number of SCC-recognized repository files.
+*   **tokens_llm_grand_total**: Grand total calculated using `cl100k_base`: repository code/docs/config plus PR/MR content.
+*   **tokens_llm_repository**: Repository-only token count (code, documentation, and configuration).
+*   **tokens_llm_code / tokens_llm_docs / tokens_llm_config**: Repository token breakdown by content type.
+*   **tokens_llm_pr**: PR/MR title, body, review-discussion, and commit-message tokens available to the analyzer.
+*   **lexical_token_grand_total**: Grand lexical-token total: repository code/docs/config plus PR/MR content.
+*   **lexical_token_repository**: Repository-only lexical-token subtotal.
+*   **lexical_token_code / lexical_token_docs / lexical_token_config**: Repository lexical-token breakdown.
+*   **lexical_token_pr**: Lexical tokens from PR/MR content.
 
 ## Languages & Frameworks
 *   **lang_count**: Total distinct programming languages detected.
@@ -57,6 +83,23 @@ This document explains the meaning behind the columns generated in the `summary_
 
 ## Process Metrics
 *   **total_time_seconds**: Execution time taken by the pipeline to analyze this repository.
+
+## Public-Exposure Estimate
+*   **public_exposure_estimate_status**: `ESTIMATE` on every provenance run, whether or not audit records are available.
+*   **public_exposure_estimate_percent**: Assumption-based exposure index from 0 to 99; blank when no scored observations are available. Audit events do not contribute. Not a calibrated probability or confirmed finding.
+*   **public_exposure_estimate_reason**: Audit availability or failure reason. Full signals, weights, contributions, and coverage gaps are in `provenance.json`. See [PROVENANCE_HEURISTICS.md](./PROVENANCE_HEURISTICS.md).
+
+## Legacy Acceptance Columns (`legacy.csv`)
+*   **repository_rating_label**: Human-readable label associated with the numeric repository rating.
+*   **Acceptance Decision**: Combined repository/project result, for example `Repository: ACCEPT | Project: REJECT`. It is `N/A` outside project mode.
+*   **Rejection Reason**: Concise failed or unverifiable repository/project requirements; contains `All requirements passed` when accepted.
+
+## Combined Legacy Output (`combined_legacy.csv`)
+*   Contains all repositories declared in the current `projects.csv`, across every project.
+*   **Project Name**: Project grouping from `projects.csv`.
+*   **Repository Target**: Original repository URL/path.
+*   **Requested Branch**: Exact requested branch, blank when the remote default was used.
+*   Remaining columns mirror project-level `legacy.csv`; analysis failures receive a synthetic row so declared repositories are not omitted.
 
 ## GitHub PR Analytics
 *   **total_pr_count**: Total number of Pull Requests found on GitHub for this repository.
