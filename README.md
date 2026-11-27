@@ -25,7 +25,7 @@ python3 --version
 The tool uses `scc` for total repository LOC, authored/non-authored LOC,
 comment/blank counts, language breakdowns, and the authored source-file token manifest.
 
-[Click here to open the SCC installation guide.](https://docs.google.com/document/d/1vukA4a4MlecNgCQk15aoH0MTGeHjkAzFG1YcHjf-QqU/edit?usp=sharing)
+[Click here to open the SCC installation guide.](./SCC_INSTALL.md)
 
 The script requires exactly `scc` version `3.7.0`, so follow the guide carefully and install that version.
 
@@ -37,24 +37,32 @@ scc --version
 
 If `scc` is missing or the installed version is not `3.7.0`, the script stops before analysis starts.
 
-### 3. Open the project in VS Code
+### 3. Download the tool
 
-Open the `legacy-code` folder in Visual Studio Code. Open a new terminal in VS Code using **Terminal → New Terminal**.
+Clone this repository (this needs `git`, see [Git requirement](#git-requirement)):
 
-### 4. Open the `repo_analysis_tool` folder
+```bash
+git clone https://github.com/codercops/repo_meta_data_script.git
+```
 
-In the VS Code terminal, run:
+You can also use **Code → Download ZIP** on the GitHub page and extract it.
+
+### 4. Open the `repo_meta_data_script` folder
+
+Open the `repo_meta_data_script` folder in Visual Studio Code. Open a new terminal in VS Code using **Terminal → New Terminal**. The terminal starts in that folder.
+
+If you use a plain terminal instead, run:
 
 Windows:
 
 ```powershell
-cd .\repo_analysis_tool\
+cd .\repo_meta_data_script\
 ```
 
 macOS or Ubuntu/Linux:
 
 ```bash
-cd ./repo_analysis_tool
+cd ./repo_meta_data_script
 ```
 
 ### 5. Create a virtual environment
