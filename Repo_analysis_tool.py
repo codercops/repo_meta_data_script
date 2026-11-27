@@ -4156,6 +4156,8 @@ def enrichBitbucketPrContentTokens(
         else:
             base = f"https://{domain}/rest/api/1.0/projects/{encodedWorkspace}/repos/{encodedRepo}/pull-requests/{number}"
             activities, activitiesOk = fetchServer(f"{base}/activities")
+            # Bitbucket Server returns comments inside the activities feed.
+            commentsOk = activitiesOk
             commitsRaw, commitsOk = fetchServer(f"{base}/commits")
             changesRaw, changesOk = fetchServer(f"{base}/changes")
             changedFiles = len(changesRaw)
