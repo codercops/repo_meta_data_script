@@ -123,15 +123,15 @@ macOS or Ubuntu/Linux:
 cp .env.example .env
 ```
 
-Open `.env` and replace the placeholder value for the version-control provider you use:
+Open `.env` and paste your token after the `=` for the version-control provider you use. For example, for GitHub only:
 
 ```text
-GITHUB_TOKEN=your-github-personal-access-token
-GITLAB_TOKEN=your-gitlab-personal-access-token
-BITBUCKET_TOKEN=your-bitbucket-access-token
+GITHUB_TOKEN=github_pat_your_token_here
+GITLAB_TOKEN=
+BITBUCKET_TOKEN=
 ```
 
-Only fill in the token or tokens you need. Do not share your tokens or commit `.env` to the repository.
+Leave the lines you don't need empty. Any text after `=` is sent as a real token, so a leftover placeholder makes cloning and the API calls fail. Do not share your tokens or commit `.env` to the repository.
 
 ### 9. Prepare the project CSV file
 
